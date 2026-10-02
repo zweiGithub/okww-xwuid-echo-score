@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import ctypes
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from decimal import Decimal
 import os
 import re
@@ -64,6 +64,12 @@ class RecognizedStatRow:
     tier_y: int
     recognition_valid: bool = True
     raw_stat_name: str = ""
+    label_bounds: tuple = ()
+    value_bounds: tuple = ()
+    text_start: float | None = None
+    text_width: float = 0
+    clean_label: str = ""
+    tier_visible: bool = True
 
     def rectangle(self, color):
         return StatRectangle(
@@ -88,9 +94,12 @@ def find_echo_stat_rectangles(ocr_boxes, screen_width, screen_height):
 
 def analyze_echo_stats(ocr_boxes, screen_width, screen_height, template_name,
                        auto_match=False, remembered_template=None, show_probability=True,
-                       target_score=40.0, probability_service=None, label_ocr=None):
+                       target_score=40.0, probability_service=None, label_ocr=None,
+                       layout_tracker=None):
     """Recognize one Echo panel and calculate its row and total scores."""
     if not screen_width or not screen_height:
+        if layout_tracker is not None:
+            layout_tracker.reset()
         return EchoStatAnalysis((), (), "")
 
     # Keep the OCR geometry unchanged. Only labels are normalized; OKWW's
@@ -119,12 +128,12 @@ def analyze_echo_stats(ocr_boxes, screen_width, screen_height, template_name,
     left_rows, left_problem = _find_ocr_rows(
         ocr_boxes, screen_width * 0.09, screen_width * 0.38,
         screen_height * 0.20, screen_height * 0.54, with_diagnostics=True,
-        label_reader=label_reader if is_tuning_page else None,
+        label_reader=label_reader if is_tuning_page and layout_tracker is None else None,
     )
     right_rows, right_problem = _find_ocr_rows(
         ocr_boxes, screen_width * 0.76, screen_width * 0.99,
         screen_height * 0.18, screen_height * 0.47, with_diagnostics=True,
-        label_reader=label_reader if is_single_echo_page and not is_tuning_page else None,
+        label_reader=label_reader if is_single_echo_page and not is_tuning_page and layout_tracker is None else None,
     )
 
     # Left-side stat rows are accepted only on the tuning page.  This excludes
@@ -135,7 +144,25 @@ def analyze_echo_stats(ocr_boxes, screen_width, screen_height, template_name,
     elif is_single_echo_page and len(right_rows) >= 2:
         rows, recognition_problem = right_rows, right_problem
     else:
+        if layout_tracker is not None:
+            layout_tracker.reset()
         return EchoStatAnalysis((), (), "", selected_template=matched_template or "")
+
+    if layout_tracker is not None:
+        if recognition_problem:
+            return EchoStatAnalysis((), (), f'识别暂不可用：{recognition_problem}',
+                                    selected_template=matched_template or '')
+        layout, problem = layout_tracker.locate(rows, screen_width, screen_height,
+                                               'tuning' if is_tuning_page else 'detail')
+        if layout is not None and not recognition_problem:
+            rows, problem = _read_layout_rows(layout, rows, label_ocr, screen_width, screen_height)
+            if problem:
+                layout_tracker.reset()
+        else:
+            problem = problem or recognition_problem
+        if problem:
+            return EchoStatAnalysis((), (), f'识别暂不可用：{problem}',
+                                    selected_template=matched_template or '')
 
     rows = rows[:7]
     main_rows, sub_rows = rows[:2], rows[2:]
@@ -162,7 +189,7 @@ def analyze_echo_stats(ocr_boxes, screen_width, screen_height, template_name,
             template_name, cost, main_rows, sub_rows, target_score,
             recognition_problem, probability_service,
         )
-    tier_labels = ("", "") + tuple(substat_tier_label(row.stat_name, row.value) for row in sub_rows)
+    tier_labels = ("", "") + tuple(substat_tier_label(row.stat_name, row.value) if row.tier_visible else "" for row in sub_rows)
     tier_colors = ((255, 0, 0), (255, 0, 0)) + tuple(
         _tier_text_color(substat_tier(row.stat_name, row.value)) for row in sub_rows
     )
@@ -299,6 +326,9 @@ def _find_ocr_rows(ocr_boxes, min_x, max_x, min_y, max_y, with_diagnostics=False
             round(prop.y + max(0, (prop.height - 18) / 2)),
             _exact_stat_label(label),
             str(getattr(prop, 'raw_stat_name', prop.name)),
+            (prop.x, prop.y, prop.width, prop.height),
+            (value.x, value.y, value.width, value.height),
+            *_label_geometry(prop),
         ))
     if with_diagnostics:
         problem = ''
@@ -308,6 +338,66 @@ def _find_ocr_rows(ocr_boxes, min_x, max_x, min_y, max_y, with_diagnostics=False
             problem = '存在未配对的名称或数值'
         return rows[:7], problem
     return rows[:7]
+
+
+def _label_geometry(prop):
+    """Clean labels already start at a glyph; prefixed boxes include an icon.
+
+    Prefix offsets are only candidate geometry for cross-row consensus, never
+    permission to accept the label itself. Unknown cropped labels stay invalid.
+    """
+    raw = re.sub(r'\s+', '', str(prop.name))
+    clean = _clean_stat_label(raw)
+    offset = 0
+    if clean != raw and _exact_stat_label(clean):
+        offset = prop.height*1.15
+    elif not _exact_stat_label(raw):
+        if len(clean)>1 and not clean[0].isdigit() and _exact_stat_label(clean[1:]):
+            clean = clean[1:]
+            offset = prop.height*1.15
+        else:
+            return None, 0, ''
+    return prop.x+offset, max(0,prop.width-offset), clean
+
+
+def _read_layout_rows(layout, full_rows, ocr, width, height):
+    """Two bounded same-frame group reads; no old values and no extra retries."""
+    if ocr is None:
+        return [], '词条裁剪识别不可用'
+    result = []
+    groups = (layout.main_centers, layout.sub_centers)
+    regions = layout.regions(width,height)
+    for centers, region in zip((g for g in groups if g), regions):
+        left,top,right,bottom = region
+        try:
+            boxes = ocr(x=left/width,y=top/height,to_x=right/width,to_y=bottom/height)
+        except Exception:
+            return [], '词条裁剪识别失败'
+        boxes = [SimpleNamespace(x=b.x,y=b.y,width=b.width,height=b.height,
+                                 name=simplify_echo_text(b.name),raw_stat_name=str(b.name)) for b in boxes]
+        rows, problem = _find_ocr_rows(boxes,left-3,right,top-3,bottom,with_diagnostics=True)
+        tolerance = max(3, (layout.main_height if not result else layout.sub_height)*.25)
+        if problem or len(rows)!=len(centers):
+            return [], '词条裁剪识别不完整'
+        for row,center in zip(rows,centers):
+            if abs(row.value_bounds[1]+row.value_bounds[3]/2-center)>tolerance:
+                return [], '词条布局正在重新定位'
+            # The crop must retain a complete exact label, even if the original
+            # full-frame OCR looked valid. Never replace it with cached text.
+            original = full_rows[len(result)]
+            if (not row.recognition_valid or not original.clean_label
+                    or row.clean_label != original.clean_label):
+                return [], '词条名称识别不完整'
+            row_height = layout.main_height if len(result)<2 else layout.sub_height
+            tier_x = round(layout.left+len(row.clean_label)*layout.glyph_width+8)
+            # A fixed tier anchor must not be clamped back over a long label.
+            # Hide it if this frame cannot prove a clear gap before the number.
+            tier_visible = (tier_x >= row.label_bounds[0]+row.label_bounds[2]+3
+                            and tier_x+max(36,row_height*1.5) <= row.value_bounds[0]-3)
+            result.append(replace(row,x=layout.left,y=round(center-row_height/2),
+                                  width=layout.right-layout.left,height=row_height,
+                                  tier_x=tier_x,tier_y=round(center-9),tier_visible=tier_visible))
+    return result, ''
 
 
 def _numeric_value(text):

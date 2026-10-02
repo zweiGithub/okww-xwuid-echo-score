@@ -89,6 +89,14 @@ class PackageBuilderTests(unittest.TestCase):
 
 
 class DistributionArchiveTests(unittest.TestCase):
+    def test_package_retains_license_and_project_attributions(self):
+        self.assertTrue((ROOT / 'echo-score' / 'LICENSE').exists())
+        self.assertEqual((ROOT / 'echo-score' / 'LICENSE').read_bytes(), (ROOT / 'LICENSE').read_bytes())
+        readme=(ROOT / 'echo-score' / 'README.md').read_text()
+        self.assertIn('https://github.com/ok-oldking/ok-wuthering-waves',readme)
+        self.assertIn('https://github.com/Loping151/XutheringWavesUID',readme)
+
+
     def test_distributed_archive_matches_current_source_bytes(self):
         expected = expected_files(ROOT / "echo-score")
         with zipfile.ZipFile(ROOT / "echo-score.zip") as archive:

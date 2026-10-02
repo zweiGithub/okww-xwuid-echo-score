@@ -124,17 +124,19 @@ class CurrentFrameHostTests(unittest.TestCase):
             task.frame=SimpleNamespace(shape=(720,1280,3))  # A newer, resized frame arrives.
             task.width=1280;task.height=720
             if x==0:return boxes
-            return [SimpleNamespace(name='暴击伤害',x=x*2048,y=y*1152,width=90,height=24)]
+            return [SimpleNamespace(name=b.name.lstrip('茶'),x=b.x,y=b.y,width=b.width,height=b.height)
+                    for b in boxes[2:] if y*1152 <= b.y+b.height/2 <= to_y*1152]
         task.ocr=ocr
         overlay=SimpleNamespace(draw=lambda *a:None,clear_draw=lambda *a:None)
         task._ensure_overlay=lambda:overlay;task.get_overlay_view=lambda:overlay
         task._settings=lambda:{'角色评分模板':'清宵-通用'}
         try:
             task.run()
-            self.assertEqual(len(calls),2)
+            self.assertEqual(len(calls),3)
             self.assertTrue(all(call[0] is frame for call in calls))
             self.assertNotIn('词条名称识别不完整',task.painter.summary)
-            self.assertTrue(.79 < calls[1][1] < .81, 'Crop uses captured frame dimensions')
+            self.assertTrue(.78 < calls[1][1] < .79, 'Consensus crop uses captured frame dimensions')
+            self.assertIn('当前评分',task.painter.summary)
         finally:task.on_destroy()
 
 

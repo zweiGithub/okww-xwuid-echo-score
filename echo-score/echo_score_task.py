@@ -6,7 +6,7 @@ from echo_score import DEFAULT_TEMPLATE
 from echo_probability_service import TuningProbabilityService
 from echo_capture_recovery import CaptureRecoveryMonitor
 from echo_stat_overlay import ECHO_STAT_PAINTER_KEY, EchoStatBoxPainter, analyze_echo_stats
-from overlay_status import paint_okww_status
+from echo_layout import EchoLayoutTracker
 
 
 STATUS_PAINTER_KEY = "echo-score-status"
@@ -20,6 +20,7 @@ class EchoScoreOverlayTask(TriggerTask):
         self.trigger_interval = 0.5
         self.visible = False
         self.painter = EchoStatBoxPainter()
+        self.layout_tracker = EchoLayoutTracker()
         self.auto_matched_template = None
         self.probability_service = TuningProbabilityService()
 
@@ -49,6 +50,7 @@ class EchoScoreOverlayTask(TriggerTask):
         overlay = app.get_overlay_view()
         if overlay is not None:
             overlay.set_boxes_enabled(False)
+            overlay.clear_draw(STATUS_PAINTER_KEY)
         return overlay
 
     def post_init(self):
@@ -73,6 +75,7 @@ class EchoScoreOverlayTask(TriggerTask):
         overlay = self._ensure_overlay()
         if overlay is None:
             return False
+        overlay.clear_draw(STATUS_PAINTER_KEY)
         settings = self._settings()
         # The portable import is always a non-development build. Ignore stale
         # cached values from older package versions and keep OCR boxes off.
@@ -101,6 +104,7 @@ class EchoScoreOverlayTask(TriggerTask):
             target_score=settings.get("目标评分", 40.0),
             probability_service=self.probability_service,
             label_ocr=lambda **bounds: self.ocr(frame=frame, **bounds),
+            layout_tracker=self.layout_tracker,
         )
         if getattr(analysis, "selected_template", None):
             self.auto_matched_template = analysis.selected_template
@@ -108,21 +112,17 @@ class EchoScoreOverlayTask(TriggerTask):
             analysis.rectangles, analysis.row_scores, analysis.summary,
             analysis.tier_labels, analysis.tier_colors,
         )
-        if analysis.rectangles:
+        if analysis.rectangles or analysis.summary:
             overlay.draw(ECHO_STAT_PAINTER_KEY, self.painter.paint)
-            if analysis.summary:
-                overlay.draw(STATUS_PAINTER_KEY, paint_okww_status)
-            else:
-                overlay.clear_draw(STATUS_PAINTER_KEY)
         else:
             self._clear(overlay)
         return False
 
     def _clear(self, overlay, include_status=False):
         self.painter.update([])
+        self.layout_tracker.reset()
         overlay.clear_draw(ECHO_STAT_PAINTER_KEY)
-        if include_status:
-            overlay.clear_draw(STATUS_PAINTER_KEY)
+        overlay.clear_draw(STATUS_PAINTER_KEY)
 
     def on_destroy(self):
         self.probability_service.close()
