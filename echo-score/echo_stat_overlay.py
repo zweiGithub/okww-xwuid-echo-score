@@ -59,6 +59,7 @@ class RecognizedStatRow:
     tier_x: int
     tier_y: int
     recognition_valid: bool = True
+    raw_stat_name: str = ""
 
     def rectangle(self, color):
         return StatRectangle(
@@ -93,6 +94,7 @@ def analyze_echo_stats(ocr_boxes, screen_width, screen_height, template_name,
     ocr_boxes = [SimpleNamespace(
         x=box.x, y=box.y, width=box.width, height=box.height,
         name=simplify_echo_text(box.name),
+        raw_stat_name=str(box.name),
     ) for box in ocr_boxes]
 
     left_rows, left_problem = _find_ocr_rows(
@@ -193,10 +195,16 @@ def _probability_summary(template_name, cost, main_rows, sub_rows, target_score,
     )
 
 
+def _clean_stat_label(text):
+    # The stat icon can join the OCR text. Remove only these leading icon
+    # symbols, never arbitrary letters, digits, CJK characters or suffixes.
+    return re.sub(r'\s+', '', str(text)).lstrip('+＋✦✧★☆·•')
+
+
 def _exact_stat_label(text):
     # Existing scoring is deliberately forgiving; probability estimates need
     # a stricter label check so a partial/unknown OCR label is not a zero roll.
-    compact = re.sub(r'\s+', '', str(text))
+    compact = _clean_stat_label(text)
     return compact in {
         '攻击', '攻击力', '生命', '生命值', '防御', '防御力', '暴击', '暴击率', '暴击伤害',
         '共鸣效率', '普攻伤害加成', '重击伤害加成', '共鸣技能伤害加成', '共鸣解放伤害加成',
@@ -235,6 +243,7 @@ def _find_ocr_rows(ocr_boxes, min_x, max_x, min_y, max_y, with_diagnostics=False
             round(prop.x + prop.width + 8),
             round(prop.y + max(0, (prop.height - 18) / 2)),
             _exact_stat_label(prop.name),
+            str(getattr(prop, 'raw_stat_name', prop.name)),
         ))
     if with_diagnostics:
         problem = ''
@@ -252,7 +261,7 @@ def _numeric_value(text):
 
 
 def _normalize_stat_name(text, value_text):
-    compact = re.sub(r"\s+", "", str(text))
+    compact = _clean_stat_label(text)
     is_percent = "%" in value_text or "％" in value_text
     if "暴击伤害" in compact:
         return "暴击伤害"

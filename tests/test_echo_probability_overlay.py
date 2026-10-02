@@ -3,6 +3,7 @@ from types import SimpleNamespace
 
 from test_echo_probability import DEFAULT_TEMPLATE
 from echo_stat_overlay import analyze_echo_stats, _find_ocr_rows
+from echo_probability_service import TuningProbabilityService
 
 
 def box(text, x, y, width=80, height=18):
@@ -13,6 +14,18 @@ def panel(subs=(('暴击', '6.3%'), ('防御', '40')), marker='声骸强化'):
     boxes = [box(marker, 10, 10), box('COST 4', 600, 50)]
     for index, (name, value) in enumerate((('暴击', '22%'), ('攻击', '150')) + tuple(subs)):
         boxes.extend((box(name, 150, 220 + index*30), box(value, 320, 220 + index*30, 60)))
+    return boxes
+
+
+def completed_panel(prefix=''):
+    """A complete 4-cost panel; no private screenshot data is required."""
+    labels = (('暴击伤害', '44.0%'), ('攻击', '150'), ('攻击', '7.9%'),
+              ('普攻伤害加成', '7.9%'), ('暴击', '6.9%'),
+              ('重击伤害加成', '8.6%'), ('共鸣效率', '8.4%'))
+    boxes = [box('声骸技能', 1606, 530), box('COST 4', 1608, 205)]
+    for index, (name, value) in enumerate(labels):
+        boxes.extend((box(prefix + name, 1610, 252 + index * 38, 175, 24),
+                      box(value, 1900, 252 + index * 38, 70, 24)))
     return boxes
 
 
@@ -29,6 +42,63 @@ class OverlayProbabilityTests(unittest.TestCase):
         self.assertIn('已识别2/5', result.summary)
         self.assertIn('核对完整词条', result.summary)
         self.assertIn('重构不适用', result.summary)
+
+    def test_complete_panel_with_plain_labels_has_deterministic_probability(self):
+        result = analyze_echo_stats(completed_panel(), 2048, 1152, '清宵-通用')
+        self.assertIn('当前评分：28.42', result.summary)
+        self.assertIn('期望终分：28.42', result.summary)
+        self.assertIn('达理论最高：100%', result.summary)
+        self.assertIn('目标≥40.00：0%', result.summary)
+
+    def test_leading_stat_icon_symbols_do_not_invalidate_complete_labels(self):
+        plain = analyze_echo_stats(completed_panel(), 2048, 1152, '清宵-通用')
+        for prefix in ('+', '＋', '✦', '✧', '★', '☆', '·', '•', ' + ✦ '):
+            with self.subTest(prefix=prefix):
+                result = analyze_echo_stats(completed_panel(prefix), 2048, 1152, '清宵-通用')
+                self.assertEqual(result.summary, plain.summary)
+                self.assertEqual(result.row_scores, plain.row_scores)
+
+    def test_icon_normalization_preserves_traditional_label_support(self):
+        result = self.analyze(panel((('＋ 重擊傷害加成', '7.9%'),)))
+        self.assertIn('期望终分', result.summary)
+
+    def test_unknown_label_characters_are_not_stripped_as_icons(self):
+        for name in ('十暴击', 'x暴击', '1暴击', '暴击错误', '+暴击错误',
+                     '暴击+', '暴击%', '暴击 1/8', '暴击伤', '共鸣技能伤害'):
+            with self.subTest(name=name):
+                result = self.analyze(panel(((name, '6.3%'),)))
+                self.assertIn('概率暂不可用', result.summary)
+                self.assertNotIn('期望终分', result.summary)
+
+    def test_recognized_row_retains_raw_ocr_label(self):
+        rows = _find_ocr_rows(panel((('+暴击', '6.3%'),)), 90, 380, 200, 540)
+        self.assertEqual(getattr(rows[2], 'raw_stat_name', None), '+暴击')
+        self.assertEqual(rows[2].stat_name, '暴击')
+        self.assertTrue(rows[2].recognition_valid)
+
+    def test_invalid_name_diagnostic_identifies_row_and_sanitizes_raw_label(self):
+        raw_name = 'x暴擊\n\x00\u202e' + '误' * 100
+        for use_service in (False, True):
+            with self.subTest(use_service=use_service):
+                service = TuningProbabilityService() if use_service else None
+                try:
+                    result = self.analyze(panel(((raw_name, '6.3%'),)), probability_service=service)
+                finally:
+                    if service is not None:
+                        service.close()
+                line = result.summary.splitlines()[-1]
+                self.assertIn('词条名称识别不完整（副词条1：', line)
+                self.assertIn('x暴擊', line)
+                self.assertIn('…', line)
+                self.assertNotIn('\x00', result.summary)
+                self.assertNotIn('\u202e', result.summary)
+                self.assertEqual(len(result.summary.splitlines()), 5)
+                self.assertLess(len(line), 65)
+
+    def test_invalid_main_name_diagnostic_uses_main_row_number(self):
+        boxes = panel()
+        boxes[2].name = 'x暴击'
+        self.assertIn('词条名称识别不完整（主词条1：', self.analyze(boxes).summary)
 
     def test_disabled_probability_preserves_original_three_line_summary(self):
         result = self.analyze(panel(), show_probability=False)
