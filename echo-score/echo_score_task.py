@@ -85,14 +85,22 @@ class EchoScoreOverlayTask(TriggerTask):
                 and self.painter.rectangles):
             return False
 
+        # Every retry must use the same captured image as the initial OCR;
+        # the host may receive a newer game frame while recognition runs.
+        frame = self.frame
+        if frame is None:
+            self._clear(overlay)
+            return False
+        height, width = frame.shape[:2]
         analysis = analyze_echo_stats(
-            self.ocr(), self.width, self.height,
+            self.ocr(frame=frame), width, height,
             settings.get("角色评分模板", DEFAULT_TEMPLATE),
             auto_match=bool(settings.get("自动匹配评分模板", False)),
             remembered_template=getattr(self, "auto_matched_template", None),
             show_probability=bool(settings.get("显示调谐概率", True)),
             target_score=settings.get("目标评分", 40.0),
             probability_service=self.probability_service,
+            label_ocr=lambda **bounds: self.ocr(frame=frame, **bounds),
         )
         if getattr(analysis, "selected_template", None):
             self.auto_matched_template = analysis.selected_template

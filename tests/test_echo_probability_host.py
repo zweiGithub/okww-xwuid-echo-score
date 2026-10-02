@@ -63,7 +63,8 @@ class HostIntegrationTests(unittest.TestCase):
         task.get_overlay_view = lambda: overlay
         task.get_tasks = lambda: (settings,)
         task.width = task.height = 1000
-        task.ocr = lambda: panel()
+        task.frame = SimpleNamespace(shape=(1000, 1000, 3))
+        task.ocr = lambda **kwargs: panel()
         try:
             task.run()
             deadline = time.monotonic() + 2

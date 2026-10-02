@@ -26,7 +26,11 @@ HIGHEST_TIER_TEXT_COLOR = (255, 75, 75)
 SUMMARY_TEMPLATE_COLOR = (110, 220, 255)
 SUMMARY_CURRENT_COLOR = (255, 220, 80)
 SUMMARY_POTENTIAL_COLOR = (120, 235, 150)
-SUMMARY_CENTER_X_RATIO = 0.60
+SUMMARY_LEFT_RATIO = 0.43
+SUMMARY_TOP_RATIO = 0.24
+SUMMARY_RIGHT_RATIO = 0.75
+SUMMARY_MAX_LINES = 10
+MAX_LABEL_OCR_RETRIES = 2
 _STAT_TEXT = re.compile(
     r"攻击|生命|防御|暴击|共鸣效率|伤害加成|治疗效果|ATK|HP|DEF|Crit|Energy|DMG|Heal",
     re.IGNORECASE,
@@ -84,7 +88,7 @@ def find_echo_stat_rectangles(ocr_boxes, screen_width, screen_height):
 
 def analyze_echo_stats(ocr_boxes, screen_width, screen_height, template_name,
                        auto_match=False, remembered_template=None, show_probability=True,
-                       target_score=40.0, probability_service=None):
+                       target_score=40.0, probability_service=None, label_ocr=None):
     """Recognize one Echo panel and calculate its row and total scores."""
     if not screen_width or not screen_height:
         return EchoStatAnalysis((), (), "")
@@ -97,14 +101,6 @@ def analyze_echo_stats(ocr_boxes, screen_width, screen_height, template_name,
         raw_stat_name=str(box.name),
     ) for box in ocr_boxes]
 
-    left_rows, left_problem = _find_ocr_rows(
-        ocr_boxes, screen_width * 0.09, screen_width * 0.38,
-        screen_height * 0.20, screen_height * 0.54, with_diagnostics=True,
-    )
-    right_rows, right_problem = _find_ocr_rows(
-        ocr_boxes, screen_width * 0.76, screen_width * 0.99,
-        screen_height * 0.18, screen_height * 0.47, with_diagnostics=True,
-    )
     screen_text = " ".join(str(box.name) for box in ocr_boxes)
     matched_template = auto_match_template(ocr_boxes) if auto_match else None
     automatic_template = matched_template or (remembered_template if auto_match else None)
@@ -118,6 +114,18 @@ def analyze_echo_stats(ocr_boxes, screen_width, screen_height, template_name,
     is_single_echo_page = any(marker in screen_text for marker in (
         "声骸技能", "合鸣效果", "Echo Skill", "Sonata Effect",
     ))
+
+    label_reader = _make_label_reader(label_ocr if show_probability else None, screen_width, screen_height)
+    left_rows, left_problem = _find_ocr_rows(
+        ocr_boxes, screen_width * 0.09, screen_width * 0.38,
+        screen_height * 0.20, screen_height * 0.54, with_diagnostics=True,
+        label_reader=label_reader if is_tuning_page else None,
+    )
+    right_rows, right_problem = _find_ocr_rows(
+        ocr_boxes, screen_width * 0.76, screen_width * 0.99,
+        screen_height * 0.18, screen_height * 0.47, with_diagnostics=True,
+        label_reader=label_reader if is_single_echo_page and not is_tuning_page else None,
+    )
 
     # Left-side stat rows are accepted only on the tuning page.  This excludes
     # the Resonator Attribute Details page and the initial Echo summary page,
@@ -213,7 +221,51 @@ def _exact_stat_label(text):
     }
 
 
-def _find_ocr_rows(ocr_boxes, min_x, max_x, min_y, max_y, with_diagnostics=False):
+def _make_label_reader(ocr, screen_width, screen_height):
+    """Retry at most two icon-contaminated labels, using only this frame's pixels.
+
+    The host callback accepts relative bounds and returns screen-space Boxes.
+    An unknown prefix is a reason to inspect the crop, never permission to
+    strip it. Both the full candidate and crop must name the same exact stat.
+    """
+    attempts = 0
+
+    def read_label(prop, value):
+        nonlocal attempts
+        compact = _clean_stat_label(prop.name)
+        candidate = compact[1:]
+        if (ocr is None or attempts >= MAX_LABEL_OCR_RETRIES or len(compact) < 2
+                or compact[0].isdigit() or not _exact_stat_label(candidate)
+                or _clean_stat_label(candidate) != candidate):
+            return str(prop.name)
+        # A stat icon occupies roughly one glyph-height at the row's left.
+        # Bound the crop by the original label box: it cannot include the
+        # value or our tier label, which is painted after that box.
+        left = max(0, round(prop.x + prop.height * 1.15))
+        right = min(screen_width, round(prop.x + prop.width), round(value.x - 2))
+        top = max(0, round(prop.y - 2))
+        bottom = min(screen_height, round(prop.y + prop.height + 2))
+        if right - left < prop.height or bottom <= top:
+            return str(prop.name)
+        attempts += 1
+        try:
+            boxes = ocr(x=left / screen_width, y=top / screen_height,
+                        to_x=right / screen_width, to_y=bottom / screen_height)
+            if len(boxes) == 1:
+                # Do not accept another icon or a partial/different label.
+                name = re.sub(r'\s+', '', simplify_echo_text(str(boxes[0].name)))
+                if name == candidate:
+                    return name
+        except Exception:
+            # A failed optional crop leaves the original safe diagnostic.
+            pass
+        return str(prop.name)
+
+    return read_label
+
+
+def _find_ocr_rows(ocr_boxes, min_x, max_x, min_y, max_y, with_diagnostics=False,
+                   label_reader=None):
     candidates = [box for box in ocr_boxes if min_x <= box.x <= max_x and min_y <= box.y <= max_y]
     properties = [box for box in candidates if _STAT_TEXT.search(str(box.name))]
     values = [box for box in candidates if _VALUE_TEXT.match(str(box.name))]
@@ -236,13 +288,16 @@ def _find_ocr_rows(ocr_boxes, min_x, max_x, min_y, max_y, with_diagnostics=False
         right = max(prop.x + prop.width, value.x + value.width) + 5
         bottom = max(prop.y + prop.height, value.y + value.height) + 3
         value_text = str(value.name)
+        label = str(prop.name)
+        if label_reader is not None and not _exact_stat_label(label):
+            label = label_reader(prop, value)
         rows.append(RecognizedStatRow(
             round(left), round(top), round(right - left), round(bottom - top),
-            _normalize_stat_name(str(prop.name), value_text),
+            _normalize_stat_name(label, value_text),
             _numeric_value(value_text), value_text,
             round(prop.x + prop.width + 8),
             round(prop.y + max(0, (prop.height - 18) / 2)),
-            _exact_stat_label(prop.name),
+            _exact_stat_label(label),
             str(getattr(prop, 'raw_stat_name', prop.name)),
         ))
     if with_diagnostics:
@@ -414,6 +469,31 @@ def _paint_bold_text(canvas, x, y, text, color):
         win32_gdi.gdi32.DeleteObject(font)
 
 
+def _fit_summary_lines(text, measure, max_width, max_lines):
+    """Wrap within a fixed area; bound arbitrary OCR diagnostic length."""
+    result = []
+    source = text.splitlines()
+    for source_index, line in enumerate(source):
+        for part_index in range(2):
+            if len(result) >= max_lines:
+                return result
+            remaining_slot = len(result) == max_lines - 1
+            truncate = part_index == 1 or remaining_slot
+            suffix = "…" if truncate and (measure(line) > max_width
+                         or remaining_slot and source_index < len(source) - 1) else ""
+            if measure(line + suffix) <= max_width:
+                result.append((source_index, line + suffix))
+                break
+            cut = 0
+            while cut < len(line) and measure(line[:cut + 1] + suffix) <= max_width:
+                cut += 1
+            result.append((source_index, line[:cut] + suffix))
+            line = line[cut:]
+            if truncate:
+                break
+    return result
+
+
 def _paint_score_summary(canvas, overlay, text):
     if os.name != "nt":
         return
@@ -429,32 +509,30 @@ def _paint_score_summary(canvas, overlay, text):
     )
     old_font = win32_gdi.gdi32.SelectObject(canvas.hdc, font)
     try:
-        lines = text.splitlines()
-        sizes = []
-        for line in lines:
-            size = win32_gdi.SIZE()
+        x = round(width * SUMMARY_LEFT_RATIO)
+        y = round(height * SUMMARY_TOP_RATIO)
+        max_width = max(1, round(width * SUMMARY_RIGHT_RATIO) - x)
+        # Font metrics, rather than the current text, define row positions.
+        size = win32_gdi.SIZE()
+        win32_gdi.gdi32.GetTextExtentPoint32W(canvas.hdc, "声骸Ag", 4, ctypes.byref(size))
+        line_height = size.cy + max(4, round(height * 0.008))
+
+        def measure(line):
+            extent = win32_gdi.SIZE()
             win32_gdi.gdi32.GetTextExtentPoint32W(
-                canvas.hdc, line, len(line), ctypes.byref(size)
-            )
-            sizes.append(size)
-        block_width = max(size.cx for size in sizes)
-        line_height = max(size.cy for size in sizes) + max(4, round(height * 0.008))
-        block_height = line_height * len(lines)
-        # Keep all lines on one shared left edge, but bias the block to the
-        # right. On the tuning page the stat rows and their score labels occupy
-        # the left side; true screen centering made the two overlays collide.
-        x = round(width * SUMMARY_CENTER_X_RATIO - block_width / 2)
-        x = max(0, min(width - block_width, x))
-        y = max(0, (height - block_height) // 2)
+                canvas.hdc, line, len(line), ctypes.byref(extent))
+            return extent.cx
+
+        lines = _fit_summary_lines(text, measure, max_width, SUMMARY_MAX_LINES)
         line_colors = (SUMMARY_TEMPLATE_COLOR, SUMMARY_CURRENT_COLOR, SUMMARY_POTENTIAL_COLOR)
-        for index, line in enumerate(lines):
+        for index, (source_index, line) in enumerate(lines):
             line_y = y + index * line_height
             for dx, dy in ((-2, 0), (2, 0), (0, -2), (0, 2)):
                 win32_gdi.gdi32.SetTextColor(canvas.hdc, win32_gdi._rgb(0, 0, 0))
                 win32_gdi.gdi32.TextOutW(
                     canvas.hdc, x + dx, line_y + dy, line, len(line)
                 )
-            color = line_colors[index] if index < len(line_colors) else SUMMARY_CURRENT_COLOR
+            color = line_colors[source_index] if source_index < len(line_colors) else SUMMARY_CURRENT_COLOR
             win32_gdi.gdi32.SetTextColor(canvas.hdc, win32_gdi._rgb(*color))
             win32_gdi.gdi32.TextOutW(canvas.hdc, x, line_y, line, len(line))
     finally:
