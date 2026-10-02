@@ -3,6 +3,7 @@
 from ok import TriggerTask, og
 
 from echo_score import DEFAULT_TEMPLATE
+from echo_probability_service import TuningProbabilityService
 from echo_capture_recovery import CaptureRecoveryMonitor
 from echo_stat_overlay import ECHO_STAT_PAINTER_KEY, EchoStatBoxPainter, analyze_echo_stats
 from overlay_status import paint_okww_status
@@ -20,6 +21,7 @@ class EchoScoreOverlayTask(TriggerTask):
         self.visible = False
         self.painter = EchoStatBoxPainter()
         self.auto_matched_template = None
+        self.probability_service = TuningProbabilityService()
 
     def on_create(self):
         self._enabled = True
@@ -62,6 +64,8 @@ class EchoScoreOverlayTask(TriggerTask):
             "启用声骸评分": True,
             "自动匹配评分模板": False,
             "角色评分模板": DEFAULT_TEMPLATE,
+            "显示调谐概率": True,
+            "目标评分": 40.0,
             "Show Debug Boxes": False,
         }
 
@@ -86,6 +90,9 @@ class EchoScoreOverlayTask(TriggerTask):
             settings.get("角色评分模板", DEFAULT_TEMPLATE),
             auto_match=bool(settings.get("自动匹配评分模板", False)),
             remembered_template=getattr(self, "auto_matched_template", None),
+            show_probability=bool(settings.get("显示调谐概率", True)),
+            target_score=settings.get("目标评分", 40.0),
+            probability_service=self.probability_service,
         )
         if getattr(analysis, "selected_template", None):
             self.auto_matched_template = analysis.selected_template
@@ -110,6 +117,7 @@ class EchoScoreOverlayTask(TriggerTask):
             overlay.clear_draw(STATUS_PAINTER_KEY)
 
     def on_destroy(self):
+        self.probability_service.close()
         if recovery := getattr(self, "capture_recovery", None):
             recovery.stop()
         overlay = self.get_overlay_view()

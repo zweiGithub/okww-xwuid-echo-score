@@ -5,6 +5,8 @@ from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QCompleter
 from qfluentwidgets import EditableComboBox, SwitchButton
 
+from echo_probability import validate_target_score
+
 from echo_score import (
     DEFAULT_TEMPLATE, matching_template_names, resolve_template_name, template_names,
 )
@@ -30,6 +32,8 @@ class EchoScoreSettingsTask(BaseTask):
             "启用声骸评分": True,
             "自动匹配评分模板": False,
             "角色评分模板": DEFAULT_TEMPLATE,
+            "显示调谐概率": True,
+            "目标评分": 40.0,
             "Show Debug Boxes": False,
         })
         self.config_type.update({
@@ -43,6 +47,8 @@ class EchoScoreSettingsTask(BaseTask):
             "启用声骸评分": "启用后台识别、词条框体和实时评分",
             "自动匹配评分模板": "根据声骸查看界面的“装配中”角色自动选择模板",
             "角色评分模板": "选择 XW-UID 角色/流派评分模板",
+            "显示调谐概率": "仅用于普通五星调谐；须核对已识别词条完整，重构/锁定重抽不适用",
+            "目标评分": "最终 +25 评分达到或超过此值的估算概率（非负数，不限 50 分）",
             "Show Debug Boxes": "显示 OK Script 的 OCR 调试框",
         })
 
@@ -95,6 +101,8 @@ class EchoScoreSettingsTask(BaseTask):
         widget._template_completer = completer
 
     def validate_config(self, key, value):
+        if key == "目标评分":
+            return validate_target_score(value)
         if key == "角色评分模板" and resolve_template_name(value) != value:
             return "请选择列表中的评分模板"
         return None

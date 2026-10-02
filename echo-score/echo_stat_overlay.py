@@ -4,12 +4,19 @@ from __future__ import annotations
 
 import ctypes
 from dataclasses import dataclass
+from decimal import Decimal
 import os
 import re
 from types import SimpleNamespace
 
-from echo_score import auto_match_template, calculate_echo_score, substat_tier, substat_tier_label
+from echo_score import (
+    auto_match_template, calculate_echo_score, resolve_template_name,
+    substat_tier, substat_tier_label, template_names,
+)
 from echo_text import simplify_echo_text
+from echo_probability import (
+    TuningProbabilityError, calculate_tuning_probability, format_probability,
+)
 
 
 ECHO_STAT_PAINTER_KEY = "echo-stat-boxes"
@@ -51,6 +58,7 @@ class RecognizedStatRow:
     value_text: str
     tier_x: int
     tier_y: int
+    recognition_valid: bool = True
 
     def rectangle(self, color):
         return StatRectangle(
@@ -70,11 +78,12 @@ class EchoStatAnalysis:
 
 def find_echo_stat_rectangles(ocr_boxes, screen_width, screen_height):
     """Build rows from the exact OCR Boxes rendered by the debug overlay."""
-    return list(analyze_echo_stats(ocr_boxes, screen_width, screen_height, "通用").rectangles)
+    return list(analyze_echo_stats(ocr_boxes, screen_width, screen_height, "通用", show_probability=False).rectangles)
 
 
 def analyze_echo_stats(ocr_boxes, screen_width, screen_height, template_name,
-                       auto_match=False, remembered_template=None):
+                       auto_match=False, remembered_template=None, show_probability=True,
+                       target_score=40.0, probability_service=None):
     """Recognize one Echo panel and calculate its row and total scores."""
     if not screen_width or not screen_height:
         return EchoStatAnalysis((), (), "")
@@ -86,19 +95,21 @@ def analyze_echo_stats(ocr_boxes, screen_width, screen_height, template_name,
         name=simplify_echo_text(box.name),
     ) for box in ocr_boxes]
 
-    left_rows = _find_ocr_rows(
+    left_rows, left_problem = _find_ocr_rows(
         ocr_boxes, screen_width * 0.09, screen_width * 0.38,
-        screen_height * 0.20, screen_height * 0.54,
+        screen_height * 0.20, screen_height * 0.54, with_diagnostics=True,
     )
-    right_rows = _find_ocr_rows(
+    right_rows, right_problem = _find_ocr_rows(
         ocr_boxes, screen_width * 0.76, screen_width * 0.99,
-        screen_height * 0.18, screen_height * 0.47,
+        screen_height * 0.18, screen_height * 0.47, with_diagnostics=True,
     )
     screen_text = " ".join(str(box.name) for box in ocr_boxes)
     matched_template = auto_match_template(ocr_boxes) if auto_match else None
     automatic_template = matched_template or (remembered_template if auto_match else None)
     if automatic_template:
         template_name = automatic_template
+    if template_name == "通用" or any(name.startswith(f"{template_name}-") for name in template_names()):
+        template_name = resolve_template_name(template_name)
     is_tuning_page = any(marker in screen_text for marker in (
         "声骸强化", "强化并调谐", "已完成全部调谐", "Echo Enhancement",
     ))
@@ -110,9 +121,9 @@ def analyze_echo_stats(ocr_boxes, screen_width, screen_height, template_name,
     # the Resonator Attribute Details page and the initial Echo summary page,
     # both of which also contain six ordinary stat rows in the same area.
     if is_tuning_page and len(left_rows) >= 2:
-        rows = left_rows
+        rows, recognition_problem = left_rows, left_problem
     elif is_single_echo_page and len(right_rows) >= 2:
-        rows = right_rows
+        rows, recognition_problem = right_rows, right_problem
     else:
         return EchoStatAnalysis((), (), "", selected_template=matched_template or "")
 
@@ -120,9 +131,13 @@ def analyze_echo_stats(ocr_boxes, screen_width, screen_height, template_name,
     main_rows, sub_rows = rows[:2], rows[2:]
     cost = _find_cost(ocr_boxes, main_rows)
     cost_key = _cost_key(cost, main_rows)
-    score = calculate_echo_score(template_name, cost, cost_key, main_rows, sub_rows)
     rectangles = tuple(row.rectangle((255, 0, 0)) for row in main_rows)
     rectangles += tuple(row.rectangle((255, 255, 255)) for row in sub_rows)
+    try:
+        score = calculate_echo_score(template_name, cost, cost_key, main_rows, sub_rows)
+    except (OverflowError, ValueError, TypeError):
+        return EchoStatAnalysis(rectangles, (), '概率暂不可用：词条数值识别异常' if show_probability else '',
+                                selected_template=matched_template or '')
     if score is None:
         return EchoStatAnalysis(rectangles, (), "", selected_template=matched_template or "")
     summary = (
@@ -130,6 +145,13 @@ def analyze_echo_stats(ocr_boxes, screen_width, screen_height, template_name,
         f"当前评分：{score.current_score:.2f}\n"
         f"理论最高：{score.potential_score:.2f}"
     )
+    if show_probability:
+        if any(marker in screen_text for marker in ('重构', '重塑', 'Reconstruction', 'Reconstruct')):
+            recognition_problem = '重构/锁定重抽不适用'
+        summary += '\n' + _probability_summary(
+            template_name, cost, main_rows, sub_rows, target_score,
+            recognition_problem, probability_service,
+        )
     tier_labels = ("", "") + tuple(substat_tier_label(row.stat_name, row.value) for row in sub_rows)
     tier_colors = ((255, 0, 0), (255, 0, 0)) + tuple(
         _tier_text_color(substat_tier(row.stat_name, row.value)) for row in sub_rows
@@ -140,7 +162,50 @@ def analyze_echo_stats(ocr_boxes, screen_width, screen_height, template_name,
     )
 
 
-def _find_ocr_rows(ocr_boxes, min_x, max_x, min_y, max_y):
+def _probability_summary(template_name, cost, main_rows, sub_rows, target_score,
+                         recognition_problem, service):
+    scope = f'五星普通估算 · 已识别{len(sub_rows)}/5'
+    caveat = '核对完整词条；重构不适用'
+    if recognition_problem:
+        return f'{scope}\n概率暂不可用：{recognition_problem}'
+    if service is not None:
+        state = service.request(template_name, cost, main_rows, sub_rows, target_score)
+        if state.status == 'pending':
+            return f'{scope}\n概率计算中…\n{caveat}'
+        if state.status != 'ready':
+            return f'{scope}\n概率暂不可用：{state.reason}'
+        projection = state.result
+    else:
+        try:
+            projection = calculate_tuning_probability(template_name, cost, main_rows, sub_rows, target_score)
+        except TuningProbabilityError as error:
+            return f'{scope}\n概率暂不可用：{error}'
+    precise_target = Decimal(str(target_score))
+    target_label = (f'{precise_target:.2f}'
+                    if precise_target < 1e6 and precise_target == precise_target.quantize(Decimal('.01'))
+                    else str(precise_target))
+    return (
+        f'{scope}\n'
+        f'期望终分：{projection.expected_score:.2f}\n'
+        f'达理论最高：{format_probability(projection.probability_at_potential)}\n'
+        f'目标≥{target_label}：{format_probability(projection.probability_at_target)}\n'
+        f'{caveat}'
+    )
+
+
+def _exact_stat_label(text):
+    # Existing scoring is deliberately forgiving; probability estimates need
+    # a stricter label check so a partial/unknown OCR label is not a zero roll.
+    compact = re.sub(r'\s+', '', str(text))
+    return compact in {
+        '攻击', '攻击力', '生命', '生命值', '防御', '防御力', '暴击', '暴击率', '暴击伤害',
+        '共鸣效率', '普攻伤害加成', '重击伤害加成', '共鸣技能伤害加成', '共鸣解放伤害加成',
+        '冷凝伤害加成', '热熔伤害加成', '导电伤害加成', '气动伤害加成',
+        '衍射伤害加成', '湮灭伤害加成', '治疗效果加成',
+    }
+
+
+def _find_ocr_rows(ocr_boxes, min_x, max_x, min_y, max_y, with_diagnostics=False):
     candidates = [box for box in ocr_boxes if min_x <= box.x <= max_x and min_y <= box.y <= max_y]
     properties = [box for box in candidates if _STAT_TEXT.search(str(box.name))]
     values = [box for box in candidates if _VALUE_TEXT.match(str(box.name))]
@@ -169,7 +234,15 @@ def _find_ocr_rows(ocr_boxes, min_x, max_x, min_y, max_y):
             _numeric_value(value_text), value_text,
             round(prop.x + prop.width + 8),
             round(prop.y + max(0, (prop.height - 18) / 2)),
+            _exact_stat_label(prop.name),
         ))
+    if with_diagnostics:
+        problem = ''
+        if len(rows) > 7:
+            problem = '识别到过多词条'
+        elif len(rows) != len(properties) or len(used_values) != len(values):
+            problem = '存在未配对的名称或数值'
+        return rows[:7], problem
     return rows[:7]
 
 
