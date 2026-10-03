@@ -88,6 +88,7 @@ class EchoStatAnalysis:
     tier_colors: tuple[tuple[int, int, int], ...] = ()
     selected_template: str = ""
     raw_rows: tuple[RecognizedStatRow, ...] = ()
+    read_rows: tuple[RecognizedStatRow, ...] = ()
 
 
 def find_echo_stat_rectangles(ocr_boxes, screen_width, screen_height):
@@ -98,7 +99,7 @@ def find_echo_stat_rectangles(ocr_boxes, screen_width, screen_height):
 def analyze_echo_stats(ocr_boxes, screen_width, screen_height, template_name,
                        auto_match=False, remembered_template=None, show_probability=True,
                        target_score=40.0, probability_service=None, label_ocr=None,
-                       layout_tracker=None):
+                       layout_tracker=None, _cached_rows=None, _cached_rectangles=None):
     """Recognize one Echo panel and calculate its row and total scores."""
     if not screen_width or not screen_height:
         if layout_tracker is not None:
@@ -127,39 +128,50 @@ def analyze_echo_stats(ocr_boxes, screen_width, screen_height, template_name,
         "声骸技能", "合鸣效果", "Echo Skill", "Sonata Effect",
     ))
 
-    left_rows, left_problem = _find_ocr_rows(
-        ocr_boxes, screen_width * 0.09, screen_width * 0.38,
-        screen_height * 0.20, screen_height * 0.54, with_diagnostics=True,
-    )
-    right_rows, right_problem = _find_ocr_rows(
-        ocr_boxes, screen_width * 0.76, screen_width * 0.99,
-        screen_height * 0.18, screen_height * 0.47, with_diagnostics=True,
-    )
-
-    # Left-side stat rows are accepted only on the tuning page.  This excludes
-    # the Resonator Attribute Details page and the initial Echo summary page,
-    # both of which also contain six ordinary stat rows in the same area.
-    if is_tuning_page and len(left_rows) >= 2:
-        rows, recognition_problem = left_rows, left_problem
-    elif is_single_echo_page and len(right_rows) >= 2:
-        rows, recognition_problem = right_rows, right_problem
+    if _cached_rows is not None:
+        # Cached success bypasses full-panel row location and column fitting.
+        rows = list(_cached_rows)
+        raw_rows = tuple(rows)
+        recognition_problem = ''
+        display_rows = [replace(row,x=anchor.x,y=anchor.y,width=anchor.width,
+                                height=anchor.height,tier_x=anchor.tier_x,tier_y=anchor.tier_y,
+                                tier_visible=(anchor.tier_x>=row.label_bounds[0]+row.label_bounds[2]+3
+                                              and anchor.tier_x+36<=row.value_bounds[0]-3))
+                        for row,anchor in zip(rows,_cached_rectangles)]
     else:
-        if layout_tracker is not None:
-            layout_tracker.reset()
-        return EchoStatAnalysis((), (), "", selected_template=matched_template or "")
+        left_rows, left_problem = _find_ocr_rows(
+            ocr_boxes, screen_width * 0.09, screen_width * 0.38,
+            screen_height * 0.20, screen_height * 0.54, with_diagnostics=True,
+        )
+        right_rows, right_problem = _find_ocr_rows(
+            ocr_boxes, screen_width * 0.76, screen_width * 0.99,
+            screen_height * 0.18, screen_height * 0.47, with_diagnostics=True,
+        )
 
-    raw_rows = tuple(rows[:7])
-    if recognition_problem:
-        return EchoStatAnalysis((), (), f"{'概率' if show_probability else '识别'}暂不可用：{recognition_problem}",
-                                selected_template=matched_template or '', raw_rows=raw_rows)
-    tracker = layout_tracker or EchoLayoutTracker()
-    columns, _ = tracker.locate(raw_rows, screen_width, screen_height,
-                               'tuning' if is_tuning_page else 'detail')
-    rows, text_verified = _read_column_labels(columns, raw_rows, label_ocr,
-                                              screen_width, screen_height)
-    if text_verified:
-        columns = tracker.confirm_text()
-    display_rows = _display_column_rows(rows, columns, screen_width)
+        # Left-side stat rows are accepted only on the tuning page.  This excludes
+        # the Resonator Attribute Details page and the initial Echo summary page,
+        # both of which also contain six ordinary stat rows in the same area.
+        if is_tuning_page and len(left_rows) >= 2:
+            rows, recognition_problem = left_rows, left_problem
+        elif is_single_echo_page and len(right_rows) >= 2:
+            rows, recognition_problem = right_rows, right_problem
+        else:
+            if layout_tracker is not None:
+                layout_tracker.reset()
+            return EchoStatAnalysis((), (), "", selected_template=matched_template or "")
+
+        raw_rows = tuple(rows[:7])
+        if recognition_problem:
+            return EchoStatAnalysis((), (), f"{'概率' if show_probability else '识别'}暂不可用：{recognition_problem}",
+                                    selected_template=matched_template or '', raw_rows=raw_rows)
+        tracker = layout_tracker or EchoLayoutTracker()
+        columns, _ = tracker.locate(raw_rows, screen_width, screen_height,
+                                   'tuning' if is_tuning_page else 'detail')
+        rows, text_verified = _read_column_labels(columns, raw_rows, label_ocr,
+                                                  screen_width, screen_height)
+        if text_verified:
+            columns = tracker.confirm_text()
+        display_rows = _display_column_rows(rows, columns, screen_width)
 
     rows = rows[:7]
     main_rows, sub_rows = rows[:2], rows[2:]
@@ -192,7 +204,7 @@ def analyze_echo_stats(ocr_boxes, screen_width, screen_height, template_name,
     )
     return EchoStatAnalysis(
         rectangles, score.row_scores, summary, tier_labels, tier_colors,
-        matched_template or "", raw_rows,
+        matched_template or "", raw_rows, tuple(rows),
     )
 
 
