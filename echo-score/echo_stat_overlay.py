@@ -3,23 +3,35 @@
 from __future__ import annotations
 
 import ctypes
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from decimal import Decimal
 import os
+import math
 import re
 from types import SimpleNamespace
 
-from echo_score import auto_match_template, calculate_echo_score, substat_tier, substat_tier_label
+from echo_score import (
+    auto_match_template, calculate_echo_score, resolve_template_name,
+    substat_tier, substat_tier_label, template_names,
+)
 from echo_text import simplify_echo_text
+from echo_probability import (
+    TuningProbabilityError, calculate_tuning_probability, format_probability,
+)
 
 
 ECHO_STAT_PAINTER_KEY = "echo-stat-boxes"
+PROBABILITY_UNAVAILABLE = "概率算不出来"
 TIER_TEXT_COLOR = (80, 185, 255)
 LOWEST_TIER_TEXT_COLOR = (80, 235, 130)
 HIGHEST_TIER_TEXT_COLOR = (255, 75, 75)
 SUMMARY_TEMPLATE_COLOR = (110, 220, 255)
 SUMMARY_CURRENT_COLOR = (255, 220, 80)
 SUMMARY_POTENTIAL_COLOR = (120, 235, 150)
-SUMMARY_CENTER_X_RATIO = 0.60
+SUMMARY_LEFT_RATIO = 0.43
+SUMMARY_TOP_RATIO = 0.24
+SUMMARY_RIGHT_RATIO = 0.75
+SUMMARY_MAX_LINES = 10
 _STAT_TEXT = re.compile(
     r"攻击|生命|防御|暴击|共鸣效率|伤害加成|治疗效果|ATK|HP|DEF|Crit|Energy|DMG|Heal",
     re.IGNORECASE,
@@ -38,6 +50,7 @@ class StatRectangle:
     color: tuple[int, int, int]
     tier_x: int = 0
     tier_y: int = 0
+    tier_font_size: int = 18
 
 
 @dataclass(frozen=True)
@@ -51,6 +64,10 @@ class RecognizedStatRow:
     value_text: str
     tier_x: int
     tier_y: int
+    recognition_valid: bool = True
+    raw_stat_name: str = ""
+    label_bounds: tuple = ()
+    value_bounds: tuple = ()
 
     def rectangle(self, color):
         return StatRectangle(
@@ -66,16 +83,19 @@ class EchoStatAnalysis:
     tier_labels: tuple[str, ...] = ()
     tier_colors: tuple[tuple[int, int, int], ...] = ()
     selected_template: str = ""
+    raw_rows: tuple[RecognizedStatRow, ...] = ()
+    read_rows: tuple[RecognizedStatRow, ...] = ()
 
 
 def find_echo_stat_rectangles(ocr_boxes, screen_width, screen_height):
     """Build rows from the exact OCR Boxes rendered by the debug overlay."""
-    return list(analyze_echo_stats(ocr_boxes, screen_width, screen_height, "通用").rectangles)
+    return list(analyze_echo_stats(ocr_boxes, screen_width, screen_height, "通用", show_probability=False).rectangles)
 
 
 def analyze_echo_stats(ocr_boxes, screen_width, screen_height, template_name,
-                       auto_match=False, remembered_template=None):
-    """Recognize one Echo panel and calculate its row and total scores."""
+                       auto_match=False, remembered_template=None, show_probability=True,
+                       target_score=40.0, probability_service=None):
+    """Recognize one Echo panel from this frame's raw OCR boxes."""
     if not screen_width or not screen_height:
         return EchoStatAnalysis((), (), "")
 
@@ -84,21 +104,16 @@ def analyze_echo_stats(ocr_boxes, screen_width, screen_height, template_name,
     ocr_boxes = [SimpleNamespace(
         x=box.x, y=box.y, width=box.width, height=box.height,
         name=simplify_echo_text(box.name),
+        raw_stat_name=str(box.name),
     ) for box in ocr_boxes]
 
-    left_rows = _find_ocr_rows(
-        ocr_boxes, screen_width * 0.09, screen_width * 0.38,
-        screen_height * 0.20, screen_height * 0.54,
-    )
-    right_rows = _find_ocr_rows(
-        ocr_boxes, screen_width * 0.76, screen_width * 0.99,
-        screen_height * 0.18, screen_height * 0.47,
-    )
     screen_text = " ".join(str(box.name) for box in ocr_boxes)
     matched_template = auto_match_template(ocr_boxes) if auto_match else None
     automatic_template = matched_template or (remembered_template if auto_match else None)
     if automatic_template:
         template_name = automatic_template
+    if template_name == "通用" or any(name.startswith(f"{template_name}-") for name in template_names()):
+        template_name = resolve_template_name(template_name)
     is_tuning_page = any(marker in screen_text for marker in (
         "声骸强化", "强化并调谐", "已完成全部调谐", "Echo Enhancement",
     ))
@@ -106,41 +121,118 @@ def analyze_echo_stats(ocr_boxes, screen_width, screen_height, template_name,
         "声骸技能", "合鸣效果", "Echo Skill", "Sonata Effect",
     ))
 
-    # Left-side stat rows are accepted only on the tuning page.  This excludes
-    # the Resonator Attribute Details page and the initial Echo summary page,
-    # both of which also contain six ordinary stat rows in the same area.
+    left_rows, left_problem = _find_ocr_rows(
+        ocr_boxes, screen_width * 0.09, screen_width * 0.38,
+        screen_height * 0.20, screen_height * 0.54, with_diagnostics=True,
+    )
+    right_rows, right_problem = _find_ocr_rows(
+        ocr_boxes, screen_width * 0.76, screen_width * 0.99,
+        screen_height * 0.18, screen_height * 0.47, with_diagnostics=True,
+    )
+    # Restrict raw stat pairing to the recognized Echo page, avoiding ordinary
+    # Resonator Attribute Details and multi-Echo summary panels.
     if is_tuning_page and len(left_rows) >= 2:
-        rows = left_rows
+        rows, recognition_problem = left_rows, left_problem
     elif is_single_echo_page and len(right_rows) >= 2:
-        rows = right_rows
+        rows, recognition_problem = right_rows, right_problem
     else:
         return EchoStatAnalysis((), (), "", selected_template=matched_template or "")
+    raw_rows = tuple(rows)
+    # Unused OCR fragments are not scoring inputs. Both calculations use the
+    # same paired rows; excessive paired slots and model errors still fail.
+    if recognition_problem == '存在未配对的名称或数值':
+        recognition_problem = ''
+    if recognition_problem:
+        return EchoStatAnalysis((), (), PROBABILITY_UNAVAILABLE if show_probability else f"识别暂不可用：{recognition_problem}",
+                                selected_template=matched_template or '', raw_rows=raw_rows)
 
     rows = rows[:7]
     main_rows, sub_rows = rows[:2], rows[2:]
     cost = _find_cost(ocr_boxes, main_rows)
     cost_key = _cost_key(cost, main_rows)
-    score = calculate_echo_score(template_name, cost, cost_key, main_rows, sub_rows)
-    rectangles = tuple(row.rectangle((255, 0, 0)) for row in main_rows)
-    rectangles += tuple(row.rectangle((255, 255, 255)) for row in sub_rows)
+    rectangles = tuple(row.rectangle((255, 0, 0) if i<2 else (255, 255, 255))
+                       for i,row in enumerate(rows))
+    rectangles = _badge_column(rectangles, raw_rows, screen_width)
+    tier_labels = ("", "") + tuple(substat_tier_label(row.stat_name, row.value) for row in rows[2:])
+    tier_colors = ((255, 0, 0), (255, 0, 0)) + tuple(
+        _tier_text_color(substat_tier(row.stat_name, row.value)) for row in sub_rows
+    )
+    try:
+        score = calculate_echo_score(template_name, cost, cost_key, main_rows, sub_rows)
+    except (OverflowError, ValueError, TypeError):
+        return EchoStatAnalysis(rectangles, (), PROBABILITY_UNAVAILABLE if show_probability else '',
+                                selected_template=matched_template or '',raw_rows=raw_rows,read_rows=tuple(rows),
+                                tier_labels=tier_labels,tier_colors=tier_colors)
     if score is None:
-        return EchoStatAnalysis(rectangles, (), "", selected_template=matched_template or "")
+        return EchoStatAnalysis(rectangles, (), PROBABILITY_UNAVAILABLE if show_probability else "", selected_template=matched_template or "",raw_rows=raw_rows,read_rows=tuple(rows),
+                                tier_labels=tier_labels,tier_colors=tier_colors)
     summary = (
         f"评分模板：{template_name}{' (自动匹配)' if automatic_template else ''}\n"
         f"当前评分：{score.current_score:.2f}\n"
         f"理论最高：{score.potential_score:.2f}"
     )
-    tier_labels = ("", "") + tuple(substat_tier_label(row.stat_name, row.value) for row in sub_rows)
-    tier_colors = ((255, 0, 0), (255, 0, 0)) + tuple(
-        _tier_text_color(substat_tier(row.stat_name, row.value)) for row in sub_rows
-    )
+    if show_probability:
+        if any(marker in screen_text for marker in ('重构', '重塑', 'Reconstruction', 'Reconstruct')):
+            recognition_problem = '重构/锁定重抽不适用'
+        summary += '\n' + _probability_summary(
+            template_name, cost, main_rows, sub_rows, target_score,
+            recognition_problem, probability_service,
+        )
     return EchoStatAnalysis(
         rectangles, score.row_scores, summary, tier_labels, tier_colors,
-        matched_template or "",
+        matched_template or "", raw_rows, tuple(rows),
     )
 
 
-def _find_ocr_rows(ocr_boxes, min_x, max_x, min_y, max_y):
+def _probability_summary(template_name, cost, main_rows, sub_rows, target_score,
+                         recognition_problem, service):
+    scope = f'五星普通估算 · 已识别{len(sub_rows)}/5'
+    caveat = '核对完整词条；重构不适用'
+    if recognition_problem:
+        return PROBABILITY_UNAVAILABLE
+    if service is not None:
+        state = service.request(template_name, cost, main_rows, sub_rows, target_score)
+        if state.status == 'pending':
+            return f'{scope}\n概率计算中…\n{caveat}'
+        if state.status != 'ready':
+            return PROBABILITY_UNAVAILABLE
+        projection = state.result
+    else:
+        try:
+            projection = calculate_tuning_probability(template_name, cost, main_rows, sub_rows, target_score)
+        except TuningProbabilityError:
+            return PROBABILITY_UNAVAILABLE
+    precise_target = Decimal(str(target_score))
+    target_label = (f'{precise_target:.2f}'
+                    if precise_target < 1e6 and precise_target == precise_target.quantize(Decimal('.01'))
+                    else str(precise_target))
+    return (
+        f'{scope}\n'
+        f'期望终分：{projection.expected_score:.2f}\n'
+        f'达理论最高：{format_probability(projection.probability_at_potential)}\n'
+        f'目标≥{target_label}：{format_probability(projection.probability_at_target)}\n'
+        f'{caveat}'
+    )
+
+
+def _clean_stat_label(text):
+    # Normalize whitespace only. Icon prefixes remain part of the raw label.
+    return re.sub(r'\s+', '', str(text))
+
+
+def _exact_stat_label(text):
+    # Retain raw-label completeness as informational metadata only. Scoring
+    # and probability both consume the canonical name from the shared parser.
+    compact = _clean_stat_label(text)
+    return compact in {
+        '攻击', '攻击力', '生命', '生命值', '防御', '防御力', '暴击', '暴击率', '暴击伤害',
+        '共鸣效率', '普攻伤害加成', '重击伤害加成', '共鸣技能伤害加成', '共鸣解放伤害加成',
+        '冷凝伤害加成', '热熔伤害加成', '导电伤害加成', '气动伤害加成',
+        '衍射伤害加成', '湮灭伤害加成', '治疗效果加成',
+    }
+
+
+def _find_ocr_rows(ocr_boxes, min_x, max_x, min_y, max_y, with_diagnostics=False):
     candidates = [box for box in ocr_boxes if min_x <= box.x <= max_x and min_y <= box.y <= max_y]
     properties = [box for box in candidates if _STAT_TEXT.search(str(box.name))]
     values = [box for box in candidates if _VALUE_TEXT.match(str(box.name))]
@@ -163,14 +255,45 @@ def _find_ocr_rows(ocr_boxes, min_x, max_x, min_y, max_y):
         right = max(prop.x + prop.width, value.x + value.width) + 5
         bottom = max(prop.y + prop.height, value.y + value.height) + 3
         value_text = str(value.name)
+        label = str(prop.name)
         rows.append(RecognizedStatRow(
             round(left), round(top), round(right - left), round(bottom - top),
-            _normalize_stat_name(str(prop.name), value_text),
+            _normalize_stat_name(label, value_text),
             _numeric_value(value_text), value_text,
             round(prop.x + prop.width + 8),
             round(prop.y + max(0, (prop.height - 18) / 2)),
+            _exact_stat_label(label),
+            str(getattr(prop, 'raw_stat_name', prop.name)),
+            (prop.x, prop.y, prop.width, prop.height),
+            (value.x, value.y, value.width, value.height),
         ))
+    if with_diagnostics:
+        problem = ''
+        if len(rows) > 7:
+            problem = '识别到过多词条'
+        elif len(rows) != len(properties) or len(used_values) != len(values):
+            problem = '存在未配对的名称或数值'
+        return rows[:7], problem
     return rows[:7]
+
+
+def _badge_column(rectangles, raw_rows, screen_width):
+    """Reserve a fixed strip outside the names/icons, away from score text.
+
+    The strip uses current panel geometry, never a previous name length.
+    Its font shrinks for narrow margins/short rows rather than hiding a tier.
+    """
+    if len(rectangles)<3:
+        return rectangles
+    left = min(min(row.x,row.label_bounds[0]) for row in raw_rows)
+    # The same supported panel-column boundary used by row acquisition keeps
+    # badges away from icons even when every OCR label excludes the icon.
+    panel_left = screen_width * (.09 if left<screen_width*.5 else .76)
+    right = max(2, math.floor(min(left,panel_left)-4))
+    size = max(1, min(18, right//2, min(r.height-2 for r in rectangles[2:])))
+    x = right-2*size
+    return tuple(replace(r,tier_x=x,tier_y=round(r.y+(r.height-size)/2),tier_font_size=size)
+                 if i>=2 else r for i,r in enumerate(rectangles))
 
 
 def _numeric_value(text):
@@ -179,7 +302,7 @@ def _numeric_value(text):
 
 
 def _normalize_stat_name(text, value_text):
-    compact = re.sub(r"\s+", "", str(text))
+    compact = _clean_stat_label(text)
     is_percent = "%" in value_text or "％" in value_text
     if "暴击伤害" in compact:
         return "暴击伤害"
@@ -276,7 +399,6 @@ class EchoStatBoxPainter:
             )
             if index < len(self.row_scores):
                 score_x = rectangle.x + rectangle.width + 8
-                tier_label = self.tier_labels[index] if index < len(self.tier_labels) else ""
                 score_lines = _score_lines(rectangle, self.row_scores[index])
                 line_height = max(13, min(18, rectangle.height // 2))
                 for line_index, line in enumerate(score_lines):
@@ -288,15 +410,17 @@ class EchoStatBoxPainter:
                         line,
                         color=rectangle.color,
                     )
-                if tier_label:
-                    tier_color = self.tier_colors[index] if index < len(self.tier_colors) else TIER_TEXT_COLOR
-                    _paint_bold_text(
-                        canvas,
-                        rectangle.tier_x or rectangle.x,
-                        rectangle.tier_y or rectangle.y,
-                        tier_label,
-                        tier_color,
-                    )
+            tier_label = self.tier_labels[index] if index < len(self.tier_labels) else ""
+            if tier_label:
+                tier_color = self.tier_colors[index] if index < len(self.tier_colors) else TIER_TEXT_COLOR
+                _paint_bold_text(
+                    canvas,
+                    rectangle.tier_x,
+                    rectangle.tier_y,
+                    tier_label,
+                    tier_color,
+                    rectangle.tier_font_size,
+                )
         if self.summary:
             _paint_score_summary(canvas, _overlay, self.summary)
 
@@ -309,7 +433,7 @@ def _score_lines(rectangle, score):
     return (f"+{score:.2f}",)
 
 
-def _paint_bold_text(canvas, x, y, text, color):
+def _paint_bold_text(canvas, x, y, text, color, font_size=18):
     """Paint an OCR-adjacent tier label with a readable bold native font."""
     if os.name != "nt":
         canvas.text(x, y, text, color=color)
@@ -317,7 +441,7 @@ def _paint_bold_text(canvas, x, y, text, color):
     from ok.ui.overlay import win32_gdi
 
     font = win32_gdi.gdi32.CreateFontW(
-        -max(16, round(18 * canvas.ratio)), 0, 0, 0, 700, 0, 0, 0,
+        -max(1, round(font_size * canvas.ratio)), 0, 0, 0, 700, 0, 0, 0,
         1, 0, 0, 5, 0, "Microsoft YaHei UI",
     )
     old_font = win32_gdi.gdi32.SelectObject(canvas.hdc, font)
@@ -330,6 +454,31 @@ def _paint_bold_text(canvas, x, y, text, color):
     finally:
         win32_gdi.gdi32.SelectObject(canvas.hdc, old_font)
         win32_gdi.gdi32.DeleteObject(font)
+
+
+def _fit_summary_lines(text, measure, max_width, max_lines):
+    """Wrap within a fixed area; bound arbitrary OCR diagnostic length."""
+    result = []
+    source = text.splitlines()
+    for source_index, line in enumerate(source):
+        for part_index in range(2):
+            if len(result) >= max_lines:
+                return result
+            remaining_slot = len(result) == max_lines - 1
+            truncate = part_index == 1 or remaining_slot
+            suffix = "…" if truncate and (measure(line) > max_width
+                         or remaining_slot and source_index < len(source) - 1) else ""
+            if measure(line + suffix) <= max_width:
+                result.append((source_index, line + suffix))
+                break
+            cut = 0
+            while cut < len(line) and measure(line[:cut + 1] + suffix) <= max_width:
+                cut += 1
+            result.append((source_index, line[:cut] + suffix))
+            line = line[cut:]
+            if truncate:
+                break
+    return result
 
 
 def _paint_score_summary(canvas, overlay, text):
@@ -347,32 +496,30 @@ def _paint_score_summary(canvas, overlay, text):
     )
     old_font = win32_gdi.gdi32.SelectObject(canvas.hdc, font)
     try:
-        lines = text.splitlines()
-        sizes = []
-        for line in lines:
-            size = win32_gdi.SIZE()
+        x = round(width * SUMMARY_LEFT_RATIO)
+        y = round(height * SUMMARY_TOP_RATIO)
+        max_width = max(1, round(width * SUMMARY_RIGHT_RATIO) - x)
+        # Font metrics, rather than the current text, define row positions.
+        size = win32_gdi.SIZE()
+        win32_gdi.gdi32.GetTextExtentPoint32W(canvas.hdc, "声骸Ag", 4, ctypes.byref(size))
+        line_height = size.cy + max(4, round(height * 0.008))
+
+        def measure(line):
+            extent = win32_gdi.SIZE()
             win32_gdi.gdi32.GetTextExtentPoint32W(
-                canvas.hdc, line, len(line), ctypes.byref(size)
-            )
-            sizes.append(size)
-        block_width = max(size.cx for size in sizes)
-        line_height = max(size.cy for size in sizes) + max(4, round(height * 0.008))
-        block_height = line_height * len(lines)
-        # Keep all lines on one shared left edge, but bias the block to the
-        # right. On the tuning page the stat rows and their score labels occupy
-        # the left side; true screen centering made the two overlays collide.
-        x = round(width * SUMMARY_CENTER_X_RATIO - block_width / 2)
-        x = max(0, min(width - block_width, x))
-        y = max(0, (height - block_height) // 2)
+                canvas.hdc, line, len(line), ctypes.byref(extent))
+            return extent.cx
+
+        lines = _fit_summary_lines(text, measure, max_width, SUMMARY_MAX_LINES)
         line_colors = (SUMMARY_TEMPLATE_COLOR, SUMMARY_CURRENT_COLOR, SUMMARY_POTENTIAL_COLOR)
-        for index, line in enumerate(lines):
+        for index, (source_index, line) in enumerate(lines):
             line_y = y + index * line_height
             for dx, dy in ((-2, 0), (2, 0), (0, -2), (0, 2)):
                 win32_gdi.gdi32.SetTextColor(canvas.hdc, win32_gdi._rgb(0, 0, 0))
                 win32_gdi.gdi32.TextOutW(
                     canvas.hdc, x + dx, line_y + dy, line, len(line)
                 )
-            color = line_colors[index] if index < len(line_colors) else SUMMARY_CURRENT_COLOR
+            color = line_colors[source_index] if source_index < len(line_colors) else SUMMARY_CURRENT_COLOR
             win32_gdi.gdi32.SetTextColor(canvas.hdc, win32_gdi._rgb(*color))
             win32_gdi.gdi32.TextOutW(canvas.hdc, x, line_y, line, len(line))
     finally:

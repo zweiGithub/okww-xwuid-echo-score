@@ -3,9 +3,10 @@
 from ok import TriggerTask, og
 
 from echo_score import DEFAULT_TEMPLATE
+from echo_probability_service import TuningProbabilityService
 from echo_capture_recovery import CaptureRecoveryMonitor
-from echo_stat_overlay import ECHO_STAT_PAINTER_KEY, EchoStatBoxPainter, analyze_echo_stats
-from overlay_status import paint_okww_status
+from echo_interval import READ_INTERVAL_KEY, DEFAULT_READ_INTERVAL_MS, read_interval_seconds
+from echo_stat_overlay import ECHO_STAT_PAINTER_KEY, PROBABILITY_UNAVAILABLE, EchoStatBoxPainter, EchoStatAnalysis, analyze_echo_stats
 
 
 STATUS_PAINTER_KEY = "echo-score-status"
@@ -16,10 +17,11 @@ class EchoScoreOverlayTask(TriggerTask):
         super().__init__(*args, **kwargs)
         self.name = "声骸评分后台识别"
         self.description = "识别单个声骸并按 XW-UID 模板评分"
-        self.trigger_interval = 0.5
+        self.trigger_interval = 1.0
         self.visible = False
         self.painter = EchoStatBoxPainter()
         self.auto_matched_template = None
+        self.probability_service = TuningProbabilityService()
 
     def on_create(self):
         self._enabled = True
@@ -47,6 +49,7 @@ class EchoScoreOverlayTask(TriggerTask):
         overlay = app.get_overlay_view()
         if overlay is not None:
             overlay.set_boxes_enabled(False)
+            overlay.clear_draw(STATUS_PAINTER_KEY)
         return overlay
 
     def post_init(self):
@@ -62,14 +65,22 @@ class EchoScoreOverlayTask(TriggerTask):
             "启用声骸评分": True,
             "自动匹配评分模板": False,
             "角色评分模板": DEFAULT_TEMPLATE,
+            "显示调谐概率": True,
+            "目标评分": 40.0,
+            READ_INTERVAL_KEY: DEFAULT_READ_INTERVAL_MS,
             "Show Debug Boxes": False,
         }
 
+    def update_read_interval(self, milliseconds):
+        self.trigger_interval = read_interval_seconds(milliseconds)
+
     def run(self):
+        settings = self._settings()
+        self.update_read_interval(settings.get(READ_INTERVAL_KEY, DEFAULT_READ_INTERVAL_MS))
         overlay = self._ensure_overlay()
         if overlay is None:
             return False
-        settings = self._settings()
+        overlay.clear_draw(STATUS_PAINTER_KEY)
         # The portable import is always a non-development build. Ignore stale
         # cached values from older package versions and keep OCR boxes off.
         if not settings.get("启用声骸评分", True):
@@ -79,26 +90,37 @@ class EchoScoreOverlayTask(TriggerTask):
         hwnd_window = getattr(getattr(og, "device_manager", None), "hwnd_window", None)
         if (hwnd_window is not None and hwnd_window.exists and not hwnd_window.visible
                 and self.painter.rectangles):
+            self._clear(overlay)
             return False
 
-        analysis = analyze_echo_stats(
-            self.ocr(), self.width, self.height,
-            settings.get("角色评分模板", DEFAULT_TEMPLATE),
+        # Read one captured frame once; a newer frame may arrive during OCR.
+        frame = self.frame
+        if frame is None:
+            self._clear(overlay)
+            return False
+        height, width = frame.shape[:2]
+        options = dict(
             auto_match=bool(settings.get("自动匹配评分模板", False)),
             remembered_template=getattr(self, "auto_matched_template", None),
+            show_probability=bool(settings.get("显示调谐概率", True)),
+            target_score=settings.get("目标评分", 40.0),
+            probability_service=self.probability_service,
         )
+        template = settings.get("角色评分模板", DEFAULT_TEMPLATE)
+        try:
+            boxes = self.ocr(frame=frame)
+            analysis = analyze_echo_stats(boxes, width, height, template, **options)
+        except Exception:
+            analysis = EchoStatAnalysis((), (), PROBABILITY_UNAVAILABLE if options['show_probability']
+                                        else '识别暂不可用：当前画面读取失败')
         if getattr(analysis, "selected_template", None):
             self.auto_matched_template = analysis.selected_template
         self.painter.update(
             analysis.rectangles, analysis.row_scores, analysis.summary,
             analysis.tier_labels, analysis.tier_colors,
         )
-        if analysis.rectangles:
+        if analysis.rectangles or analysis.summary:
             overlay.draw(ECHO_STAT_PAINTER_KEY, self.painter.paint)
-            if analysis.summary:
-                overlay.draw(STATUS_PAINTER_KEY, paint_okww_status)
-            else:
-                overlay.clear_draw(STATUS_PAINTER_KEY)
         else:
             self._clear(overlay)
         return False
@@ -106,10 +128,11 @@ class EchoScoreOverlayTask(TriggerTask):
     def _clear(self, overlay, include_status=False):
         self.painter.update([])
         overlay.clear_draw(ECHO_STAT_PAINTER_KEY)
-        if include_status:
-            overlay.clear_draw(STATUS_PAINTER_KEY)
+        overlay.clear_draw(STATUS_PAINTER_KEY)
 
     def on_destroy(self):
+        self.painter.update([])
+        self.probability_service.close()
         if recovery := getattr(self, "capture_recovery", None):
             recovery.stop()
         overlay = self.get_overlay_view()

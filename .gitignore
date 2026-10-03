@@ -17,3 +17,6 @@ env/
 dist/
 build/
 *.egg-info/
+
+# Private diagnostic output from optional diagnostic builds
+echo-score/diagnostics/
