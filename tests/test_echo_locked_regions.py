@@ -193,7 +193,7 @@ class LockedRegionTests(unittest.TestCase):
         task=self.make_task();task.run()
         self.assertTrue(all(isinstance(v,int) for roi in (task.region_cache.guard_roi,*task.region_cache.row_rois) for v in roi))
 
-    def test_guard_conflicting_value_or_label_forces_reacquisition(self):
+    def test_guard_conflicting_value_or_label_preserves_lock_and_reports_status(self):
         for kind in ('value','label','unknown'):
             with self.subTest(kind=kind):
                 task=self.make_task();task.run();self.full_calls=0
@@ -208,7 +208,9 @@ class LockedRegionTests(unittest.TestCase):
                             elif kind=='unknown' and b.name=='攻击':b.name='攻击错误'
                     return result
                 task.ocr=ocr;task.run()
-                self.assertEqual(self.full_calls,1)
+                self.assertEqual(self.full_calls,0)
+                self.assertIsNotNone(task.region_cache)
+                self.assertNotIn('当前评分',task.painter.summary)
 
     def test_guard_single_icon_candidate_requires_matching_fresh_row_label(self):
         task=self.make_task();task.run();self.full_calls=0
@@ -275,7 +277,9 @@ class LockedRegionTests(unittest.TestCase):
         self.assertNotEqual(tuple(task.painter.row_scores),initial)
         self.assertTrue(all(calls))
         self.boxes[1].name='COST ?';calls.clear();task.run()
-        self.assertEqual(sum(not b for b in calls),1,'Unreadable explicit metadata invalidates cache')
+        self.assertEqual(sum(not b for b in calls),0,'Unreadable metadata must not invalidate row geometry')
+        self.assertIsNotNone(task.region_cache)
+        self.assertNotIn('当前评分',task.painter.summary)
 
     def test_initially_missing_cost_does_not_lock_out_later_metadata_recovery(self):
         from test_echo_probability_overlay import panel
@@ -289,12 +293,13 @@ class LockedRegionTests(unittest.TestCase):
             return [deepcopy(b) for b in self.boxes if b.x>=bounds['x']*1000-.01 and b.y>=bounds['y']*1000-.01
                     and b.x+b.width<=bounds['to_x']*1000+.01 and b.y+b.height<=bounds['to_y']*1000+.01]
         task.ocr=ocr;task.run();initial=tuple(task.painter.row_scores)
-        self.assertIsNone(task.region_cache)
-        self.assertIn('当前评分',task.painter.summary)
+        self.assertIsNotNone(task.region_cache)
+        self.assertNotIn('当前评分',task.painter.summary)
+        self.assertIn('COST',task.painter.summary)
         self.boxes[1].name='COST 3';calls.clear();task.run()
-        self.assertEqual(sum(not b for b in calls),1)
+        self.assertEqual(sum(not b for b in calls),0)
         self.assertNotEqual(tuple(task.painter.row_scores),initial)
         self.assertIsNotNone(task.region_cache)
-        self.assertGreater(task.region_cache.cost_roi[0],task.region_cache.guard_roi[2])
+        self.assertEqual(task.region_cache.cost_roi,(0,0,1000,200))
         calls.clear();task.run()
         self.assertTrue(all(calls))

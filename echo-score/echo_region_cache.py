@@ -6,7 +6,8 @@ from types import SimpleNamespace
 
 from echo_score import SUBSTAT_TIERS
 from echo_text import simplify_echo_text
-from echo_stat_overlay import _find_ocr_rows
+from echo_stat_overlay import (_find_ocr_rows, _STAT_TEXT, _VALUE_TEXT, RecognizedStatRow,
+    _exact_stat_label, _normalize_stat_name, _numeric_value, _label_geometry)
 
 _TUNING = ('声骸强化','强化并调谐','已完成全部调谐','Echo Enhancement')
 _DETAIL = ('声骸技能','合鸣效果','Echo Skill','Sonata Effect')
@@ -17,20 +18,48 @@ def _page(boxes):
     return 'tuning' if any(m in text for m in _TUNING) else 'detail' if any(m in text for m in _DETAIL) else None
 
 
-def _cost_boxes(boxes):
-    """Find the same explicit COST source as scoring, without retaining its value."""
-    for box in boxes:
-        if re.search(r'COST\s*[134]',str(box.name),re.I):
-            return (box,)
+def _cost_sources(boxes):
+    sources=[]
     digits=[b for b in boxes if str(b.name).strip() in {'1','3','4'}]
-    for label in boxes:
-        if not re.search('COST',str(label.name),re.I):
-            continue
-        nearby=[b for b in digits if label.x-10<=b.x<=label.x+label.width+150
-                and abs((b.y+b.height/2)-(label.y+label.height/2))<35]
-        if nearby:
-            return label,min(nearby,key=lambda b:abs(b.x-label.x))
-    return ()
+    for box in boxes:
+        text=str(box.name)
+        for value in re.findall(r'COST\s*([134])(?=\s|$)',text,re.I):
+            sources.append(((box,),int(value)))
+        if re.fullmatch(r'\s*COST\s*[:：]?\s*',text,re.I):
+            nearby=[b for b in digits if box.x-10<=b.x<=box.x+box.width+150
+                    and abs((b.y+b.height/2)-(box.y+box.height/2))<35]
+            if nearby:
+                digit=min(nearby,key=lambda b:abs(b.x-box.x))
+                sources.append(((box,digit),int(str(digit.name).strip())))
+    return sources
+
+
+def _cost_boxes(boxes):
+    sources=_cost_sources(boxes)
+    return sources[0][0] if len({value for _,value in sources})==1 else ()
+
+
+def explicit_cost(boxes):
+    values={value for _,value in _cost_sources(boxes)}
+    return next(iter(values)) if len(values)==1 else None
+
+
+def metadata_problem(boxes, expected_page=None):
+    page=_page(boxes)
+    if page is None or (expected_page is not None and page!=expected_page):
+        return '页面信息未确认'
+    if explicit_cost(boxes) is None:
+        return 'COST 未确认'
+    return ''
+
+
+@dataclass(frozen=True)
+class FreshRegionRead:
+    rows: tuple
+    boxes: tuple
+    problem: str
+    cost: int | None
+    more_rows: bool = False
 
 
 def valid_read_rows(rows):
@@ -62,12 +91,16 @@ class EchoRegionCache:
     cost_roi: tuple | None
     row_rois: tuple
     rectangles: tuple
+    tier_visible: tuple
+    tier_capacity: tuple
+    cost_extra_rois: tuple
+    cost_coverage_complete: bool
 
     @classmethod
     def acquire(cls, boxes, analysis, width, height):
         rows = analysis.read_rows
-        page = _page(boxes)
-        if not page or not valid_read_rows(rows) or len(analysis.rectangles)!=len(rows):
+        page = _page(boxes) or ('tuning' if rows and rows[0].x<width*.5 else 'detail')
+        if not valid_read_rows(rows) or len(analysis.rectangles)!=len(rows):
             return None
         # This guard spans every supported slot, not just currently unlocked rows.
         count = ((width*.09,height*.20,width*.38,height*.54) if page=='tuning' else
@@ -85,77 +118,102 @@ class EchoRegionCache:
                          min(width,math.ceil(max(anchor.x+anchor.width,vx+vw)+pad)),
                          min(height,math.ceil(max(y+h,vy+vh)+pad))))
         cost = _cost_boxes(boxes)
-        if not cost:
-            # Do not lock an inferred COST while its actual metadata location
-            # is unknown; the next acquisition may recover that missing text.
-            return None
         cost_roi = ((max(0,math.floor(min(b.x for b in cost)-pad)),
                      max(0,math.floor(min(b.y for b in cost)-pad)),
                      min(width,math.ceil(max(b.x+b.width for b in cost)+pad)),
-                     min(height,math.ceil(max(b.y+b.height for b in cost)+pad))) if cost else None)
+                     min(height,math.ceil(max(b.y+b.height for b in cost)+pad))) if cost else (0,0,width,math.ceil(height*.20)))
         # A metadata crop is deliberately small; never disguise a whole frame
         # as one COST ROI when an unrelated paragraph happens to mention it.
-        if cost_roi and (cost_roi[2]-cost_roi[0]>width*.35 or cost_roi[3]-cost_roi[1]>height*.12):
-            return None
+        if cost and (cost_roi[2]-cost_roi[0]>width*.35 or cost_roi[3]-cost_roi[1]>height*.12):
+            cost_roi=(0,0,width,math.ceil(height*.20))
+        extras=[]
+        coverage_complete=True
+        contains=lambda outer,inner: (outer[0]<=inner[0] and outer[1]<=inner[1]
+                                      and inner[2]<=outer[2] and inner[3]<=outer[3])
+        for source,value in _cost_sources(boxes):
+            roi=(max(0,math.floor(min(b.x for b in source)-pad)),
+                 max(0,math.floor(min(b.y for b in source)-pad)),
+                 min(width,math.ceil(max(b.x+b.width for b in source)+pad)),
+                 min(height,math.ceil(max(b.y+b.height for b in source)+pad)))
+            if contains(guard,roi) or contains(cost_roi,roi) or roi in extras:
+                continue
+            if len(extras)<3 and roi[2]-roi[0]<=width*.35 and roi[3]-roi[1]<=height*.12:
+                extras.append(roi)
+            else:
+                coverage_complete=False
         if any(not all(math.isfinite(v) for v in roi) or roi[2]<=roi[0] or roi[3]<=roi[1]
                for roi in [guard,*rois]):
             return None
-        return cls(width,height,page,guard,count,cost_roi,tuple(rois),tuple(analysis.rectangles))
+        return cls(width,height,page,guard,count,cost_roi,tuple(rois),tuple(analysis.rectangles),
+                   tuple(bool(label) for label in analysis.tier_labels),
+                   tuple(len(row.clean_label) for row in rows),tuple(extras),coverage_complete)
 
     def read(self, ocr):
-        """Return only current-frame content, or fail without partial old rows."""
+        """Only unprocessable row text fails geometry; metadata is separate."""
         def crop(roi):
             x,y,right,bottom=roi
-            boxes=ocr(x=x/self.width,y=y/self.height,to_x=right/self.width,to_y=bottom/self.height)
-            # Host OCR boxes use screen coordinates. Reject out-of-crop results.
-            if any(not all(math.isfinite(v) for v in (b.x,b.y,b.width,b.height))
-                   or b.width<=0 or b.height<=0 or b.x<x-.01 or b.y<y-.01
-                   or b.x+b.width>right+.01 or b.y+b.height>bottom+.01 for b in boxes):
-                raise ValueError('OCR outside cached region')
-            return boxes
+            return ocr(x=x/self.width,y=y/self.height,to_x=right/self.width,to_y=bottom/self.height)
+        rows=[]
         try:
-            guard = crop(self.guard_roi)
-            if _page(guard)!=self.page:
-                return None
-            normalize = lambda boxes: [SimpleNamespace(x=b.x,y=b.y,width=b.width,height=b.height,
-                name=simplify_echo_text(str(b.name)),raw_stat_name=str(b.name)) for b in boxes]
-            x,y,right,bottom=self.count_roi
-            guard_rows,problem=_find_ocr_rows(normalize(guard),x,right,y,bottom,with_diagnostics=True)
-            # A guard may include one icon prefix. It supplies a candidate only;
-            # the dedicated row crop must independently confirm the exact name.
-            if (problem or len(guard_rows)!=len(self.row_rois)
-                    or any(not row.clean_label for row in guard_rows)
-                    or not valid_read_rows([replace(row,recognition_valid=True) for row in guard_rows])):
-                return None
-            rows=[]
-            for roi,guard_row in zip(self.row_rois,guard_rows):
+            for roi,anchor in zip(self.row_rois,self.rectangles):
                 boxes=crop(roi)
-                # Normalize this fresh read, never copy the previous label.
-                boxes=normalize(boxes)
-                found,problem=_find_ocr_rows(boxes,*[roi[i] for i in (0,2,1,3)],with_diagnostics=True)
-                if problem or len(found)!=1:
+                labels=[b for b in boxes if _STAT_TEXT.search(simplify_echo_text(str(b.name)))]
+                values=[b for b in boxes if _VALUE_TEXT.match(str(b.name))]
+                if len(labels)!=1 or len(values)!=1:
                     return None
-                row=found[0]
-                if (row.clean_label!=guard_row.clean_label or row.stat_name!=guard_row.stat_name
-                        or row.value!=guard_row.value
-                        or (('%' in row.value_text or '％' in row.value_text) !=
-                            ('%' in guard_row.value_text or '％' in guard_row.value_text))):
-                    return None
-                rows.append(row)
+                prop,value=labels[0],values[0]
+                name=simplify_echo_text(str(prop.name));value_text=str(value.name)
+                normalized=SimpleNamespace(x=prop.x,y=prop.y,width=prop.width,height=prop.height,name=name)
+                rows.append(RecognizedStatRow(anchor.x,anchor.y,anchor.width,anchor.height,
+                    _normalize_stat_name(name,value_text),_numeric_value(value_text),value_text,
+                    anchor.tier_x,anchor.tier_y,_exact_stat_label(name),str(prop.name),
+                    (prop.x,prop.y,prop.width,prop.height),(value.x,value.y,value.width,value.height),
+                    *_label_geometry(normalized)))
             if not valid_read_rows(rows):
                 return None
-            metadata = ()
-            if self.cost_roi:
-                x,y,right,bottom=self.cost_roi
-                gx,gy,gr,gb=self.guard_roi
-                if gx<=x and gy<=y and right<=gr and bottom<=gb:
-                    boxes=[b for b in guard if x<=b.x and y<=b.y
-                           and b.x+b.width<=right and b.y+b.height<=bottom]
-                else:
-                    boxes=crop(self.cost_roi)
-                metadata=_cost_boxes(boxes)
-                if not metadata:
-                    return None
-            return tuple(rows),list(metadata)+guard
         except Exception:
             return None
+        # Failure/noise in these reads never replaces valid row geometry.
+        try:
+            guard=list(crop(self.guard_roi))
+        except Exception:
+            guard=[]
+        metadata=[]
+        try:
+            x,y,right,bottom=self.cost_roi
+            gx,gy,gr,gb=self.guard_roi
+            if gx<=x and gy<=y and right<=gr and bottom<=gb:
+                metadata=[b for b in guard if x<=b.x+b.width/2<=right and y<=b.y+b.height/2<=bottom]
+            else:
+                metadata=list(crop(self.cost_roi))
+        except Exception:
+            pass
+        coverage_complete=self.cost_coverage_complete
+        for roi in self.cost_extra_rois:
+            try:
+                extra=list(crop(roi))
+                coverage_complete=coverage_complete and explicit_cost(extra) is not None
+                metadata.extend(extra)
+            except Exception:
+                coverage_complete=False
+        boxes=metadata+guard
+        problem=metadata_problem(boxes,self.page)
+        if not coverage_complete:
+            problem=problem or 'COST 范围未确认'
+        more_rows=False
+        try:
+            normalize=lambda bs:[SimpleNamespace(x=b.x,y=b.y,width=b.width,height=b.height,
+                name=simplify_echo_text(str(b.name)),raw_stat_name=str(b.name)) for b in bs]
+            x,y,right,bottom=self.count_roi
+            observed,pairing=_find_ocr_rows(normalize(guard),x,right,y,bottom,with_diagnostics=True)
+            candidates=[replace(r,recognition_valid=bool(r.clean_label)) for r in observed]
+            valid=not pairing and valid_read_rows(candidates)
+            identity=lambda r:(r.clean_label,r.stat_name,r.value)
+            prefix=valid and [identity(r) for r in candidates[:len(rows)]]==[identity(r) for r in rows]
+            more_rows=bool(prefix and len(candidates)>len(rows)
+                           and all(r.recognition_valid for r in observed[len(rows):]))
+            if not valid or len(candidates)!=len(rows) or not prefix:
+                problem=problem or '词条完整性未确认'
+        except Exception:
+            problem=problem or '词条完整性未确认'
+        return FreshRegionRead(tuple(rows),tuple(boxes),problem,explicit_cost(boxes),more_rows)

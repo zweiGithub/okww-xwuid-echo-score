@@ -99,7 +99,9 @@ def find_echo_stat_rectangles(ocr_boxes, screen_width, screen_height):
 def analyze_echo_stats(ocr_boxes, screen_width, screen_height, template_name,
                        auto_match=False, remembered_template=None, show_probability=True,
                        target_score=40.0, probability_service=None, label_ocr=None,
-                       layout_tracker=None, _cached_rows=None, _cached_rectangles=None):
+                       layout_tracker=None, _cached_rows=None, _cached_rectangles=None,
+                       _cached_tier_visible=None, _metadata_problem="", _explicit_cost=None,
+                       _allow_uncertain_context=False):
     """Recognize one Echo panel and calculate its row and total scores."""
     if not screen_width or not screen_height:
         if layout_tracker is not None:
@@ -135,9 +137,8 @@ def analyze_echo_stats(ocr_boxes, screen_width, screen_height, template_name,
         recognition_problem = ''
         display_rows = [replace(row,x=anchor.x,y=anchor.y,width=anchor.width,
                                 height=anchor.height,tier_x=anchor.tier_x,tier_y=anchor.tier_y,
-                                tier_visible=(anchor.tier_x>=row.label_bounds[0]+row.label_bounds[2]+3
-                                              and anchor.tier_x+36<=row.value_bounds[0]-3))
-                        for row,anchor in zip(rows,_cached_rectangles)]
+                                tier_visible=_cached_tier_visible[i] if _cached_tier_visible is not None else row.tier_visible)
+                        for i,(row,anchor) in enumerate(zip(rows,_cached_rectangles))]
     else:
         left_rows, left_problem = _find_ocr_rows(
             ocr_boxes, screen_width * 0.09, screen_width * 0.38,
@@ -155,6 +156,8 @@ def analyze_echo_stats(ocr_boxes, screen_width, screen_height, template_name,
             rows, recognition_problem = left_rows, left_problem
         elif is_single_echo_page and len(right_rows) >= 2:
             rows, recognition_problem = right_rows, right_problem
+        elif _allow_uncertain_context and ((len(left_rows)>=2) != (len(right_rows)>=2)):
+            rows, recognition_problem = (left_rows,left_problem) if len(left_rows)>=2 else (right_rows,right_problem)
         else:
             if layout_tracker is not None:
                 layout_tracker.reset()
@@ -175,17 +178,26 @@ def analyze_echo_stats(ocr_boxes, screen_width, screen_height, template_name,
 
     rows = rows[:7]
     main_rows, sub_rows = rows[:2], rows[2:]
-    cost = _find_cost(ocr_boxes, main_rows)
+    cost = _explicit_cost if _explicit_cost is not None else _find_cost(ocr_boxes, main_rows)
     cost_key = _cost_key(cost, main_rows)
     rectangles = tuple(row.rectangle((255, 0, 0) if i<2 else (255, 255, 255))
                        for i,row in enumerate(display_rows))
+    tier_labels = ("", "") + tuple(substat_tier_label(row.stat_name, row.value) if row.tier_visible else "" for row in display_rows[2:])
+    tier_colors = ((255, 0, 0), (255, 0, 0)) + tuple(
+        _tier_text_color(substat_tier(row.stat_name, row.value)) for row in sub_rows
+    )
+    if _metadata_problem:
+        return EchoStatAnalysis(rectangles, (), '评分暂不可用：'+_metadata_problem,
+                                tier_labels,tier_colors,matched_template or '',raw_rows,tuple(rows))
     try:
         score = calculate_echo_score(template_name, cost, cost_key, main_rows, sub_rows)
     except (OverflowError, ValueError, TypeError):
         return EchoStatAnalysis(rectangles, (), '概率暂不可用：词条数值识别异常' if show_probability else '',
-                                selected_template=matched_template or '')
+                                selected_template=matched_template or '',raw_rows=raw_rows,read_rows=tuple(rows),
+                                tier_labels=tier_labels,tier_colors=tier_colors)
     if score is None:
-        return EchoStatAnalysis(rectangles, (), "", selected_template=matched_template or "")
+        return EchoStatAnalysis(rectangles, (), "", selected_template=matched_template or "",raw_rows=raw_rows,read_rows=tuple(rows),
+                                tier_labels=tier_labels,tier_colors=tier_colors)
     summary = (
         f"评分模板：{template_name}{' (自动匹配)' if automatic_template else ''}\n"
         f"当前评分：{score.current_score:.2f}\n"
@@ -198,10 +210,6 @@ def analyze_echo_stats(ocr_boxes, screen_width, screen_height, template_name,
             template_name, cost, main_rows, sub_rows, target_score,
             recognition_problem, probability_service,
         )
-    tier_labels = ("", "") + tuple(substat_tier_label(row.stat_name, row.value) if row.tier_visible else "" for row in display_rows[2:])
-    tier_colors = ((255, 0, 0), (255, 0, 0)) + tuple(
-        _tier_text_color(substat_tier(row.stat_name, row.value)) for row in sub_rows
-    )
     return EchoStatAnalysis(
         rectangles, score.row_scores, summary, tier_labels, tier_colors,
         matched_template or "", raw_rows, tuple(rows),
@@ -495,7 +503,6 @@ class EchoStatBoxPainter:
             )
             if index < len(self.row_scores):
                 score_x = rectangle.x + rectangle.width + 8
-                tier_label = self.tier_labels[index] if index < len(self.tier_labels) else ""
                 score_lines = _score_lines(rectangle, self.row_scores[index])
                 line_height = max(13, min(18, rectangle.height // 2))
                 for line_index, line in enumerate(score_lines):
@@ -507,15 +514,16 @@ class EchoStatBoxPainter:
                         line,
                         color=rectangle.color,
                     )
-                if tier_label:
-                    tier_color = self.tier_colors[index] if index < len(self.tier_colors) else TIER_TEXT_COLOR
-                    _paint_bold_text(
-                        canvas,
-                        rectangle.tier_x or rectangle.x,
-                        rectangle.tier_y or rectangle.y,
-                        tier_label,
-                        tier_color,
-                    )
+            tier_label = self.tier_labels[index] if index < len(self.tier_labels) else ""
+            if tier_label:
+                tier_color = self.tier_colors[index] if index < len(self.tier_colors) else TIER_TEXT_COLOR
+                _paint_bold_text(
+                    canvas,
+                    rectangle.tier_x or rectangle.x,
+                    rectangle.tier_y or rectangle.y,
+                    tier_label,
+                    tier_color,
+                )
         if self.summary:
             _paint_score_summary(canvas, _overlay, self.summary)
 

@@ -9,7 +9,7 @@ from echo_probability_service import TuningProbabilityService
 from echo_capture_recovery import CaptureRecoveryMonitor
 from echo_stat_overlay import ECHO_STAT_PAINTER_KEY, EchoStatBoxPainter, EchoStatAnalysis, analyze_echo_stats
 from echo_layout import EchoLayoutTracker
-from echo_region_cache import EchoRegionCache, valid_read_rows
+from echo_region_cache import EchoRegionCache, valid_read_rows, metadata_problem, explicit_cost
 
 
 STATUS_PAINTER_KEY = "echo-score-status"
@@ -113,18 +113,23 @@ class EchoScoreOverlayTask(TriggerTask):
         cache = self.region_cache
         if cache is not None and (cache.width,cache.height)==(width,height):
             fresh = cache.read(reader)
-            if fresh is not None:
-                rows,guard = fresh
-                analysis = analyze_echo_stats(guard,width,height,template,**options,
-                                             _cached_rows=rows,_cached_rectangles=cache.rectangles)
+            if fresh is not None and not fresh.more_rows:
+                problem=fresh.problem
+                analysis = analyze_echo_stats(fresh.boxes,width,height,template,**options,
+                    _cached_rows=fresh.rows,_cached_rectangles=cache.rectangles,
+                    _cached_tier_visible=tuple(visible and len(row.clean_label)<=capacity
+                        for visible,capacity,row in zip(cache.tier_visible,cache.tier_capacity,fresh.rows)),
+                    _metadata_problem=problem,_explicit_cost=fresh.cost)
         if analysis is None:
             # Exactly one acquisition attempt per tick, using this same frame.
             self.region_cache = None
             self.layout_tracker.reset()
             try:
                 boxes = reader()
+                problem=metadata_problem(boxes)
                 analysis = analyze_echo_stats(boxes,width,height,template,**options,
-                                             label_ocr=reader,layout_tracker=self.layout_tracker)
+                    label_ocr=reader,layout_tracker=self.layout_tracker,_allow_uncertain_context=True,
+                    _metadata_problem=problem,_explicit_cost=explicit_cost(boxes))
                 self.region_cache = EchoRegionCache.acquire(boxes,analysis,width,height)
                 if analysis.raw_rows and not valid_read_rows(analysis.read_rows):
                     analysis = replace(analysis,rectangles=(),row_scores=(),tier_labels=(),tier_colors=(),
