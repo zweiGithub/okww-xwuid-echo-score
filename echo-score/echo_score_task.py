@@ -5,6 +5,7 @@ from ok import TriggerTask, og
 from echo_score import DEFAULT_TEMPLATE
 from echo_probability_service import TuningProbabilityService
 from echo_capture_recovery import CaptureRecoveryMonitor
+from echo_interval import READ_INTERVAL_KEY, DEFAULT_READ_INTERVAL_MS, read_interval_seconds
 from echo_stat_overlay import ECHO_STAT_PAINTER_KEY, PROBABILITY_UNAVAILABLE, EchoStatBoxPainter, EchoStatAnalysis, analyze_echo_stats
 
 
@@ -66,15 +67,20 @@ class EchoScoreOverlayTask(TriggerTask):
             "角色评分模板": DEFAULT_TEMPLATE,
             "显示调谐概率": True,
             "目标评分": 40.0,
+            READ_INTERVAL_KEY: DEFAULT_READ_INTERVAL_MS,
             "Show Debug Boxes": False,
         }
 
+    def update_read_interval(self, milliseconds):
+        self.trigger_interval = read_interval_seconds(milliseconds)
+
     def run(self):
+        settings = self._settings()
+        self.update_read_interval(settings.get(READ_INTERVAL_KEY, DEFAULT_READ_INTERVAL_MS))
         overlay = self._ensure_overlay()
         if overlay is None:
             return False
         overlay.clear_draw(STATUS_PAINTER_KEY)
-        settings = self._settings()
         # The portable import is always a non-development build. Ignore stale
         # cached values from older package versions and keep OCR boxes off.
         if not settings.get("启用声骸评分", True):

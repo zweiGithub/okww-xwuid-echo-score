@@ -6,6 +6,7 @@ from PySide6.QtWidgets import QCompleter
 from qfluentwidgets import EditableComboBox, SwitchButton
 
 from echo_probability import validate_target_score
+from echo_interval import READ_INTERVAL_KEY, DEFAULT_READ_INTERVAL_MS, MAX_READ_INTERVAL_MS, validate_read_interval
 
 from echo_score import (
     DEFAULT_TEMPLATE, matching_template_names, resolve_template_name, template_names,
@@ -27,18 +28,20 @@ class EchoScoreSettingsTask(BaseTask):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.name = "声骸评分设置"
-        self.description = "配置评分模板；修改后立即生效"
+        self.description = "配置评分模板和读取间隔；保存后自动生效"
         self.default_config.update({
             "启用声骸评分": True,
             "自动匹配评分模板": False,
             "角色评分模板": DEFAULT_TEMPLATE,
             "显示调谐概率": True,
             "目标评分": 40.0,
+            READ_INTERVAL_KEY: DEFAULT_READ_INTERVAL_MS,
             "Show Debug Boxes": False,
         })
         self.config_type.update({
             "启用声骸评分": {"hidden": True},
             "角色评分模板": {"type": "drop_down", "options": template_names()},
+            READ_INTERVAL_KEY: {"min": 1, "max": MAX_READ_INTERVAL_MS},
             # Imported packages are a user-facing distribution. OCR boxes are
             # a development diagnostic and must not appear in this UI.
             "Show Debug Boxes": {"hidden": True},
@@ -49,8 +52,26 @@ class EchoScoreSettingsTask(BaseTask):
             "角色评分模板": "选择 XW-UID 角色/流派评分模板",
             "显示调谐概率": "仅用于普通五星调谐；须核对已识别词条完整，重构/锁定重抽不适用",
             "目标评分": "最终 +25 评分达到或超过此值的估算概率（非负数，不限 50 分）",
+            READ_INTERVAL_KEY: "正整数毫秒，默认 1000；保存后自动生效。间隔越小 OCR 负载越高，实际刷新受识别耗时限制",
             "Show Debug Boxes": "显示 OK Script 的 OCR 调试框",
         })
+
+    def _apply_read_interval(self):
+        for task in self.get_tasks():
+            if task.__class__.__name__ == 'EchoScoreOverlayTask':
+                task.update_read_interval(self.config.get(READ_INTERVAL_KEY, DEFAULT_READ_INTERVAL_MS))
+                # The host's public enqueue method only wakes (returns False)
+                # for trigger tasks; it does not queue a one-shot execution.
+                task.executor.enqueue_onetime_task(task)
+
+    def _install_interval_listener(self, card):
+        widget = card.config_widget_by_key.get(READ_INTERVAL_KEY)
+        if widget is None or getattr(widget, '_echo_interval_connected', False):
+            return
+        # The native control's existing first slot validates/persists the value.
+        widget.spin_box.valueChanged.connect(lambda _value: self._apply_read_interval())
+        widget._echo_interval_connected = True
+        self._apply_read_interval()
 
     def _install_total_switch(self, card):
         if getattr(card, "_echo_total_switch", None) is not None:
@@ -101,6 +122,8 @@ class EchoScoreSettingsTask(BaseTask):
         widget._template_completer = completer
 
     def validate_config(self, key, value):
+        if key == READ_INTERVAL_KEY:
+            return validate_read_interval(value)
         if key == "目标评分":
             return validate_target_score(value)
         if key == "角色评分模板" and resolve_template_name(value) != value:
@@ -133,6 +156,7 @@ def _patch_imported_task_card():
             return
         task._install_total_switch(card)
         task._install_search_combo(card)
+        task._install_interval_listener(card)
         card.setExpand(True)
 
     TaskCard.__init__ = patched_init
