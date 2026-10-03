@@ -1,15 +1,11 @@
 """Portable OK Script adapter for Echo scoring."""
 
-from dataclasses import replace
-
 from ok import TriggerTask, og
 
 from echo_score import DEFAULT_TEMPLATE
 from echo_probability_service import TuningProbabilityService
 from echo_capture_recovery import CaptureRecoveryMonitor
 from echo_stat_overlay import ECHO_STAT_PAINTER_KEY, EchoStatBoxPainter, EchoStatAnalysis, analyze_echo_stats
-from echo_layout import EchoLayoutTracker
-from echo_region_cache import EchoRegionCache, valid_read_rows, metadata_problem, explicit_cost
 
 
 STATUS_PAINTER_KEY = "echo-score-status"
@@ -20,11 +16,9 @@ class EchoScoreOverlayTask(TriggerTask):
         super().__init__(*args, **kwargs)
         self.name = "声骸评分后台识别"
         self.description = "识别单个声骸并按 XW-UID 模板评分"
-        self.trigger_interval = 0.5
+        self.trigger_interval = 1.0
         self.visible = False
         self.painter = EchoStatBoxPainter()
-        self.layout_tracker = EchoLayoutTracker()
-        self.region_cache = None
         self.auto_matched_template = None
         self.probability_service = TuningProbabilityService()
 
@@ -93,8 +87,7 @@ class EchoScoreOverlayTask(TriggerTask):
             self._clear(overlay)
             return False
 
-        # Every retry must use the same captured image as the initial OCR;
-        # the host may receive a newer game frame while recognition runs.
+        # Read one captured frame once; a newer frame may arrive during OCR.
         frame = self.frame
         if frame is None:
             self._clear(overlay)
@@ -107,35 +100,12 @@ class EchoScoreOverlayTask(TriggerTask):
             target_score=settings.get("目标评分", 40.0),
             probability_service=self.probability_service,
         )
-        reader = lambda **bounds: self.ocr(frame=frame, **bounds)
         template = settings.get("角色评分模板", DEFAULT_TEMPLATE)
-        analysis = None
-        cache = self.region_cache
-        if cache is not None and (cache.width,cache.height)==(width,height):
-            fresh = cache.read(reader)
-            if fresh is not None and not fresh.more_rows:
-                problem=fresh.problem
-                analysis = analyze_echo_stats(fresh.boxes,width,height,template,**options,
-                    _cached_rows=fresh.rows,_cached_rectangles=cache.rectangles,
-                    _metadata_problem=problem,_explicit_cost=fresh.cost)
-        if analysis is None:
-            # Exactly one acquisition attempt per tick, using this same frame.
-            self.region_cache = None
-            self.layout_tracker.reset()
-            try:
-                boxes = reader()
-                problem=metadata_problem(boxes)
-                analysis = analyze_echo_stats(boxes,width,height,template,**options,
-                    label_ocr=reader,layout_tracker=self.layout_tracker,_allow_uncertain_context=True,
-                    _metadata_problem=problem,_explicit_cost=explicit_cost(boxes))
-                self.region_cache = EchoRegionCache.acquire(boxes,analysis,width,height)
-                if analysis.raw_rows and not valid_read_rows(analysis.read_rows):
-                    analysis = replace(analysis,rectangles=(),row_scores=(),tier_labels=(),tier_colors=(),
-                                       summary='识别暂不可用：词条名称、数值或完整性未确认')
-            except Exception:
-                self.region_cache = None
-                self.layout_tracker.reset()
-                analysis = EchoStatAnalysis((),(), '识别暂不可用：当前画面读取失败')
+        try:
+            boxes = self.ocr(frame=frame)
+            analysis = analyze_echo_stats(boxes, width, height, template, **options)
+        except Exception:
+            analysis = EchoStatAnalysis((), (), '识别暂不可用：当前画面读取失败')
         if getattr(analysis, "selected_template", None):
             self.auto_matched_template = analysis.selected_template
         self.painter.update(
@@ -150,14 +120,10 @@ class EchoScoreOverlayTask(TriggerTask):
 
     def _clear(self, overlay, include_status=False):
         self.painter.update([])
-        self.layout_tracker.reset()
-        self.region_cache = None
         overlay.clear_draw(ECHO_STAT_PAINTER_KEY)
         overlay.clear_draw(STATUS_PAINTER_KEY)
 
     def on_destroy(self):
-        self.region_cache = None
-        self.layout_tracker.reset()
         self.painter.update([])
         self.probability_service.close()
         if recovery := getattr(self, "capture_recovery", None):

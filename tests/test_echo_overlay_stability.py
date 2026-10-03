@@ -1,4 +1,4 @@
-"""Current-frame OCR repair and stable summary geometry; synthetic inputs only."""
+"""Raw-label safeguards and summary geometry; synthetic inputs only."""
 import ctypes
 from types import ModuleType, SimpleNamespace
 import sys
@@ -7,23 +7,19 @@ from unittest.mock import patch
 
 import test_echo_probability_host as host
 from test_echo_probability_overlay import box, panel, completed_panel
-from test_echo_columns import compact_panel
 from echo_stat_overlay import analyze_echo_stats, _paint_score_summary
 
 
-class LabelCropTests(unittest.TestCase):
-    def test_unknown_or_multiple_prefixes_are_never_guessed_without_anchors(self):
+class RawLabelTests(unittest.TestCase):
+    def test_unknown_or_multiple_prefixes_are_not_accepted_as_complete_names(self):
         for name in ('茶茶暴击','1暴击','暴击错误','暴击伤'):
             boxes=panel(((name,'6.3%'),))
-            result=analyze_echo_stats(boxes,1000,1000,'清宵-通用',label_ocr=lambda **kw:[])
+            result=analyze_echo_stats(boxes,1000,1000,'清宵-通用',show_probability=True)
             self.assertNotIn('期望终分',result.summary)
 
-    def test_non_echo_pages_never_call_cropped_ocr(self):
-        calls=[]
-        result=analyze_echo_stats(completed_panel()[1:],2048,1152,'清宵-通用',
-                                  label_ocr=lambda **kw:calls.append(kw) or [])
+    def test_non_echo_pages_are_ignored(self):
+        result=analyze_echo_stats(completed_panel()[1:],2048,1152,'清宵-通用')
         self.assertEqual(result.summary,'')
-        self.assertEqual(calls,[])
 
 
 class CurrentFrameHostTests(unittest.TestCase):
@@ -42,32 +38,6 @@ class CurrentFrameHostTests(unittest.TestCase):
             self.assertEqual(task.painter.summary,'')
         finally:task.on_destroy()
 
-    def test_retry_uses_exact_same_frame_and_host_ocr_keyword_signature(self):
-        task=host.load_module('echo_score_task').EchoScoreOverlayTask()
-        task.width=2560;task.height=1440;task.frame=SimpleNamespace(shape=(1440,2560,3))
-        frame=task.frame;calls=[]
-        boxes=compact_panel();boxes[4].name='茶攻击'
-        def ocr(x=0,y=0,to_x=1,to_y=1,match=None,width=0,height=0,box=None,name=None,
-                threshold=0,frame=None,target_height=0,use_grayscale=False,log=False,
-                screenshot=False,frame_processor=None,lib='default'):
-            calls.append((frame,x,y,to_x,to_y))
-            task.frame=SimpleNamespace(shape=(720,1280,3))  # A newer, resized frame arrives.
-            task.width=1280;task.height=720
-            if x==0:return boxes
-            p=next(p for p in boxes[2::2] if abs(p.y-y*1440)<.001)
-            return [SimpleNamespace(name=p.name.lstrip('+茶'),x=2050,y=p.y,width=min(p.x+p.width-2050,220),height=p.height)]
-        task.ocr=ocr
-        overlay=SimpleNamespace(draw=lambda *a:None,clear_draw=lambda *a:None)
-        task._ensure_overlay=lambda:overlay;task.get_overlay_view=lambda:overlay
-        task._settings=lambda:{'角色评分模板':'清宵-通用'}
-        try:
-            task.run()
-            self.assertEqual(len(calls),8)
-            self.assertTrue(all(call[0] is frame for call in calls))
-            self.assertNotIn('词条名称识别不完整',task.painter.summary)
-            self.assertTrue(.79 < calls[1][1] < .81, 'Name crop uses captured frame dimensions')
-            self.assertIn('当前评分',task.painter.summary)
-        finally:task.on_destroy()
 
 
 class SummaryLayoutTests(unittest.TestCase):

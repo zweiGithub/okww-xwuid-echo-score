@@ -50,16 +50,17 @@ class OverlayProbabilityTests(unittest.TestCase):
         self.assertIn('达理论最高：100%', result.summary)
         self.assertIn('目标≥40.00：0%', result.summary)
 
-    def test_leading_stat_icon_symbols_do_not_invalidate_complete_labels(self):
+    def test_leading_icon_symbols_remain_visible_to_strict_name_validation(self):
         plain = analyze_echo_stats(completed_panel(), 2048, 1152, '清宵-通用')
         for prefix in ('+', '＋', '✦', '✧', '★', '☆', '·', '•', ' + ✦ '):
             with self.subTest(prefix=prefix):
                 result = analyze_echo_stats(completed_panel(prefix), 2048, 1152, '清宵-通用')
-                self.assertEqual(result.summary, plain.summary)
+                self.assertIn('名称识别不完整', result.summary)
+                self.assertNotIn('期望终分', result.summary)
                 self.assertEqual(result.row_scores, plain.row_scores)
 
-    def test_icon_normalization_preserves_traditional_label_support(self):
-        result = self.analyze(panel((('＋ 重擊傷害加成', '7.9%'),)))
+    def test_whitespace_normalization_preserves_traditional_label_support(self):
+        result = self.analyze(panel(((' 重擊傷害加成 ', '7.9%'),)))
         self.assertIn('期望终分', result.summary)
 
     def test_unknown_label_characters_are_not_stripped_as_icons(self):
@@ -74,7 +75,7 @@ class OverlayProbabilityTests(unittest.TestCase):
         rows = _find_ocr_rows(panel((('+暴击', '6.3%'),)), 90, 380, 200, 540)
         self.assertEqual(getattr(rows[2], 'raw_stat_name', None), '+暴击')
         self.assertEqual(rows[2].stat_name, '暴击')
-        self.assertTrue(rows[2].recognition_valid)
+        self.assertFalse(rows[2].recognition_valid)
 
     def test_invalid_name_diagnostic_identifies_row_and_sanitizes_raw_label(self):
         raw_name = 'x暴擊\n\x00\u202e' + '误' * 100
