@@ -91,8 +91,6 @@ class EchoRegionCache:
     cost_roi: tuple | None
     row_rois: tuple
     rectangles: tuple
-    tier_visible: tuple
-    tier_capacity: tuple
     cost_extra_rois: tuple
     cost_coverage_complete: bool
 
@@ -145,8 +143,7 @@ class EchoRegionCache:
                for roi in [guard,*rois]):
             return None
         return cls(width,height,page,guard,count,cost_roi,tuple(rois),tuple(analysis.rectangles),
-                   tuple(bool(label) for label in analysis.tier_labels),
-                   tuple(len(row.clean_label) for row in rows),tuple(extras),coverage_complete)
+                   tuple(extras),coverage_complete)
 
     def read(self, ocr):
         """Only unprocessable row text fails geometry; metadata is separate."""
@@ -200,6 +197,11 @@ class EchoRegionCache:
         problem=metadata_problem(boxes,self.page)
         if not coverage_complete:
             problem=problem or 'COST 范围未确认'
+        # Dedicated reads already verified both mains and five unique legal
+        # substats. A broad re-read cannot reveal an additional supported slot.
+        # Metadata above remains independent; partial panels still check below.
+        if len(rows)==7:
+            return FreshRegionRead(tuple(rows),tuple(boxes),problem,explicit_cost(boxes))
         more_rows=False
         try:
             normalize=lambda bs:[SimpleNamespace(x=b.x,y=b.y,width=b.width,height=b.height,

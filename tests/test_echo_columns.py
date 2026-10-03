@@ -191,15 +191,15 @@ class ColumnRegressionTests(unittest.TestCase):
                 self.assertNotIn('期望终分',result.summary)
                 self.assertIn('词条名称识别不完整',result.summary)
 
-    def test_long_label_tier_is_after_text_or_hidden_when_no_gap(self):
+    def test_long_label_tier_uses_independent_column_even_without_inline_gap(self):
         boxes=compact_panel()
         for label in ('共鸣技能伤害加成','共鸣解放伤害加成'):
             boxes[8].name=label;boxes[8].width=230
             result=analyze(boxes,EchoLayoutTracker())
-            self.assertGreaterEqual(result.rectangles[3].tier_x,boxes[8].x+boxes[8].width+3)
+            self.assertLess(result.rectangles[3].tier_x, result.rectangles[3].x)
             boxes[9].x=boxes[8].x+boxes[8].width+15
             crowded=analyze(boxes,EchoLayoutTracker())
-            self.assertEqual(crowded.tier_labels[3],'')
+            self.assertEqual(crowded.tier_labels[3],'3档')
             boxes[9].x=2371
 
     def test_validated_display_anchor_resets_after_real_horizontal_move(self):

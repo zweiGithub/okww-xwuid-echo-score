@@ -193,10 +193,10 @@ class LockedRegionTests(unittest.TestCase):
         task=self.make_task();task.run()
         self.assertTrue(all(isinstance(v,int) for roi in (task.region_cache.guard_roi,*task.region_cache.row_rois) for v in roi))
 
-    def test_guard_conflicting_value_or_label_preserves_lock_and_reports_status(self):
+    def test_partial_guard_conflicting_value_or_label_preserves_lock_and_reports_status(self):
         for kind in ('value','label','unknown'):
             with self.subTest(kind=kind):
-                task=self.make_task();task.run();self.full_calls=0
+                task=self.make_task(5);task.run();self.full_calls=0
                 original=task.ocr;guard=task.region_cache.guard_roi
                 def ocr(frame=None,**bounds):
                     result=original(frame=frame,**bounds)

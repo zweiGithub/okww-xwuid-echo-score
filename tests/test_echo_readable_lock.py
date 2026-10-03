@@ -164,13 +164,13 @@ class ReadableLockTests(unittest.TestCase):
         self.assertIn('当前评分',task.painter.summary)
         self.assertIn('清宵',task.painter.summary)
 
-    def test_longer_new_label_hides_tier_without_moving_any_anchor(self):
+    def test_longer_new_label_keeps_tier_without_moving_any_anchor(self):
         task=self.make_task();task.run();first=tuple(task.painter.rectangles);self.full_calls=0
         self.boxes[6].name='共鸣解放伤害加成';self.boxes[6].width=290;self.boxes[7].name='7.9%'
         task.run()
         self.assertEqual(tuple(task.painter.rectangles),first)
         self.assertEqual(self.full_calls,0)
-        self.assertEqual(task.painter.tier_labels[2],'')
+        self.assertEqual(task.painter.tier_labels[2],'3档')
 
     def test_score_unavailable_does_not_break_latched_tier_geometry(self):
         from unittest.mock import patch

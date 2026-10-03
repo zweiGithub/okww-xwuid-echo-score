@@ -51,6 +51,7 @@ class StatRectangle:
     color: tuple[int, int, int]
     tier_x: int = 0
     tier_y: int = 0
+    tier_font_size: int = 18
 
 
 @dataclass(frozen=True)
@@ -100,7 +101,7 @@ def analyze_echo_stats(ocr_boxes, screen_width, screen_height, template_name,
                        auto_match=False, remembered_template=None, show_probability=True,
                        target_score=40.0, probability_service=None, label_ocr=None,
                        layout_tracker=None, _cached_rows=None, _cached_rectangles=None,
-                       _cached_tier_visible=None, _metadata_problem="", _explicit_cost=None,
+                       _metadata_problem="", _explicit_cost=None,
                        _allow_uncertain_context=False):
     """Recognize one Echo panel and calculate its row and total scores."""
     if not screen_width or not screen_height:
@@ -136,8 +137,7 @@ def analyze_echo_stats(ocr_boxes, screen_width, screen_height, template_name,
         raw_rows = tuple(rows)
         recognition_problem = ''
         display_rows = [replace(row,x=anchor.x,y=anchor.y,width=anchor.width,
-                                height=anchor.height,tier_x=anchor.tier_x,tier_y=anchor.tier_y,
-                                tier_visible=_cached_tier_visible[i] if _cached_tier_visible is not None else row.tier_visible)
+                                height=anchor.height,tier_x=anchor.tier_x,tier_y=anchor.tier_y)
                         for i,(row,anchor) in enumerate(zip(rows,_cached_rectangles))]
     else:
         left_rows, left_problem = _find_ocr_rows(
@@ -182,7 +182,9 @@ def analyze_echo_stats(ocr_boxes, screen_width, screen_height, template_name,
     cost_key = _cost_key(cost, main_rows)
     rectangles = tuple(row.rectangle((255, 0, 0) if i<2 else (255, 255, 255))
                        for i,row in enumerate(display_rows))
-    tier_labels = ("", "") + tuple(substat_tier_label(row.stat_name, row.value) if row.tier_visible else "" for row in display_rows[2:])
+    rectangles = (tuple(_cached_rectangles) if _cached_rectangles is not None else
+                  _badge_column(rectangles, raw_rows, screen_width))
+    tier_labels = ("", "") + tuple(substat_tier_label(row.stat_name, row.value) for row in rows[2:])
     tier_colors = ((255, 0, 0), (255, 0, 0)) + tuple(
         _tier_text_color(substat_tier(row.stat_name, row.value)) for row in sub_rows
     )
@@ -400,6 +402,25 @@ def _display_column_rows(rows, columns, width):
     return result
 
 
+def _badge_column(rectangles, raw_rows, screen_width):
+    """Reserve a fixed strip outside the names/icons, away from score text.
+
+    The strip depends only on panel geometry, never the current name length.
+    Its font shrinks for narrow margins/short rows rather than hiding a tier.
+    """
+    if len(rectangles)<3:
+        return rectangles
+    left = min(min(row.x,row.label_bounds[0]) for row in raw_rows)
+    # The same supported panel-column boundary used by row acquisition keeps
+    # badges away from icons even when every OCR label excludes the icon.
+    panel_left = screen_width * (.09 if left<screen_width*.5 else .76)
+    right = max(2, math.floor(min(left,panel_left)-4))
+    size = max(1, min(18, right//2, min(r.height-2 for r in rectangles[2:])))
+    x = right-2*size
+    return tuple(replace(r,tier_x=x,tier_y=round(r.y+(r.height-size)/2),tier_font_size=size)
+                 if i>=2 else r for i,r in enumerate(rectangles))
+
+
 def _numeric_value(text):
     match = re.search(r"\d+(?:[.,]\d+)?", str(text).replace("，", "."))
     return float(match.group(0).replace(",", ".")) if match else 0.0
@@ -519,10 +540,11 @@ class EchoStatBoxPainter:
                 tier_color = self.tier_colors[index] if index < len(self.tier_colors) else TIER_TEXT_COLOR
                 _paint_bold_text(
                     canvas,
-                    rectangle.tier_x or rectangle.x,
-                    rectangle.tier_y or rectangle.y,
+                    rectangle.tier_x,
+                    rectangle.tier_y,
                     tier_label,
                     tier_color,
+                    rectangle.tier_font_size,
                 )
         if self.summary:
             _paint_score_summary(canvas, _overlay, self.summary)
@@ -536,7 +558,7 @@ def _score_lines(rectangle, score):
     return (f"+{score:.2f}",)
 
 
-def _paint_bold_text(canvas, x, y, text, color):
+def _paint_bold_text(canvas, x, y, text, color, font_size=18):
     """Paint an OCR-adjacent tier label with a readable bold native font."""
     if os.name != "nt":
         canvas.text(x, y, text, color=color)
@@ -544,7 +566,7 @@ def _paint_bold_text(canvas, x, y, text, color):
     from ok.ui.overlay import win32_gdi
 
     font = win32_gdi.gdi32.CreateFontW(
-        -max(16, round(18 * canvas.ratio)), 0, 0, 0, 700, 0, 0, 0,
+        -max(1, round(font_size * canvas.ratio)), 0, 0, 0, 700, 0, 0, 0,
         1, 0, 0, 5, 0, "Microsoft YaHei UI",
     )
     old_font = win32_gdi.gdi32.SelectObject(canvas.hdc, font)

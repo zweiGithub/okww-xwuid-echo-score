@@ -117,8 +117,6 @@ class EchoScoreOverlayTask(TriggerTask):
                 problem=fresh.problem
                 analysis = analyze_echo_stats(fresh.boxes,width,height,template,**options,
                     _cached_rows=fresh.rows,_cached_rectangles=cache.rectangles,
-                    _cached_tier_visible=tuple(visible and len(row.clean_label)<=capacity
-                        for visible,capacity,row in zip(cache.tier_visible,cache.tier_capacity,fresh.rows)),
                     _metadata_problem=problem,_explicit_cost=fresh.cost)
         if analysis is None:
             # Exactly one acquisition attempt per tick, using this same frame.
