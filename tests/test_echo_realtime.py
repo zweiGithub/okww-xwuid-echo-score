@@ -66,8 +66,8 @@ class RealtimeTests(unittest.TestCase):
         self.assertEqual(rows[2].raw_stat_name,'+攻击')
         self.assertFalse(rows[2].recognition_valid)
         result=analyze_echo_stats(self.boxes,2048,1152,'清宵-通用')
-        self.assertIn('名称识别不完整',result.summary)
-        self.assertNotIn('期望终分',result.summary)
+        self.assertIn('期望终分',result.summary)
+        self.assertNotIn('名称识别不完整',result.summary)
 
     def test_disabled_or_no_frame_clears_without_ocr(self):
         task=self.make_task();task.run();self.calls.clear()

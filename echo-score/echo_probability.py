@@ -14,7 +14,6 @@ from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation, ROUND_CEILING, localcontext
 from functools import lru_cache
 import math
-import unicodedata
 
 from echo_score import (
     MAX_MAINSTAT_VALUES, SCORE_PER_ECHO, SUBSTAT_TIERS, TEMPLATE_OPTIONS,
@@ -68,20 +67,8 @@ def validate_target_score(value):
     return None
 
 
-def _invalid_name_reason(row, index):
-    raw = str(getattr(row, 'raw_stat_name', '') or getattr(row, 'stat_name', ''))
-    # Keep diagnostic text on one bounded line, including with control or
-    # bidirectional-format characters in unexpected OCR output.
-    safe = ''.join(' ' if unicodedata.category(char).startswith('C') else char for char in raw)
-    label = ' '.join(safe.split())
-    if len(label) > 24:
-        label = label[:24] + '…'
-    position = f'主词条{index + 1}' if index < 2 else f'副词条{index - 1}'
-    return f'词条名称识别不完整（{position}：「{label}」）'
-
-
 def validate_tuning_input(template_name, cost, main_rows, sub_rows, target_score):
-    """Validate supplied rows, not rarity, level or unseen OCR completeness."""
+    """Validate scoring's canonical rows and model constraints, not raw OCR labels."""
     if error := validate_target_score(target_score):
         return error
     if template_name not in TEMPLATE_OPTIONS:
@@ -95,8 +82,6 @@ def validate_tuning_input(template_name, cost, main_rows, sub_rows, target_score
         return '副词条重复，请核对识别'
     for index, row in enumerate(tuple(main_rows) + tuple(sub_rows)):
         name, value = getattr(row, 'stat_name', ''), getattr(row, 'value', None)
-        if not getattr(row, 'recognition_valid', True):
-            return _invalid_name_reason(row, index)
         if not _valid_number(value) or float(value) <= 0:
             return '词条数值识别异常'
         text = getattr(row, 'value_text', None)

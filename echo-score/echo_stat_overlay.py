@@ -216,8 +216,8 @@ def _clean_stat_label(text):
 
 
 def _exact_stat_label(text):
-    # Existing scoring is deliberately forgiving; probability estimates need
-    # a stricter label check so a partial/unknown OCR label is not a zero roll.
+    # Retain raw-label completeness as informational metadata only. Scoring
+    # and probability both consume the canonical name from the shared parser.
     compact = _clean_stat_label(text)
     return compact in {
         '攻击', '攻击力', '生命', '生命值', '防御', '防御力', '暴击', '暴击率', '暴击伤害',

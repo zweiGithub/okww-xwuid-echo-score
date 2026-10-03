@@ -37,8 +37,7 @@ class TuningProbabilityService:
             return ProjectionState('invalid', reason=error)
         # Snapshot mutable OCR objects before handing them to a worker.
         def snapshot(rows):
-            return tuple((r.stat_name, float(r.value), getattr(r, 'value_text', None),
-                          getattr(r, 'recognition_valid', True)) for r in rows)
+            return tuple((r.stat_name, float(r.value), getattr(r, 'value_text', None)) for r in rows)
         main, sub = snapshot(main_rows), snapshot(sub_rows)
         key = (template_name, cost, main, sub, str(target_score))
         if self._pending is not None and self._pending[1].done():
@@ -57,8 +56,8 @@ class TuningProbabilityService:
             return self._cache[key]
         if self._pending is None:
             def restore(rows):
-                return tuple(SimpleNamespace(stat_name=name, value=value, value_text=text,
-                                             recognition_valid=valid) for name, value, text, valid in rows)
+                return tuple(SimpleNamespace(stat_name=name, value=value, value_text=text)
+                             for name, value, text in rows)
             future = self._executor.submit(self._calculate, template_name, cost,
                                            restore(main), restore(sub), target_score)
             self._pending = (key, future)

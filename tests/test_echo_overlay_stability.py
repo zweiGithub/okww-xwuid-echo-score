@@ -11,11 +11,12 @@ from echo_stat_overlay import analyze_echo_stats, _paint_score_summary
 
 
 class RawLabelTests(unittest.TestCase):
-    def test_unknown_or_multiple_prefixes_are_not_accepted_as_complete_names(self):
+    def test_scoring_matched_prefixes_use_canonical_probability_names(self):
         for name in ('茶茶暴击','1暴击','暴击错误','暴击伤'):
             boxes=panel(((name,'6.3%'),))
             result=analyze_echo_stats(boxes,1000,1000,'清宵-通用',show_probability=True)
-            self.assertNotIn('期望终分',result.summary)
+            self.assertIn('期望终分',result.summary)
+            self.assertEqual(result.raw_rows[2].raw_stat_name,name)
 
     def test_non_echo_pages_are_ignored(self):
         result=analyze_echo_stats(completed_panel()[1:],2048,1152,'清宵-通用')
