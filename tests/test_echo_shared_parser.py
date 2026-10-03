@@ -50,5 +50,5 @@ class SharedParserTests(unittest.TestCase):
         unknown=replace(rows[2],stat_name='神秘属性',recognition_valid=False)
         self.assertIn('类型无法识别',validate_tuning_input('清宵-通用',4,rows[:2],[unknown],40))
         duplicate=analyze_echo_stats(panel((('暴击','6.3%'),('茶暴击','6.9%'))),1000,1000,'清宵-通用')
-        self.assertIn('副词条重复',duplicate.summary)
+        self.assertEqual(duplicate.summary.splitlines()[-1],'概率算不出来')
         self.assertNotIn('期望终分',duplicate.summary)

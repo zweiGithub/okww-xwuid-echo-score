@@ -79,12 +79,11 @@ class RealtimeTests(unittest.TestCase):
         self.assertEqual(task.painter.row_scores,[])
 
     def test_empty_failed_or_other_page_read_never_keeps_old_content(self):
-        for mode in ('empty','exception','other_page','missing_value'):
+        for mode in ('empty','exception','other_page'):
             with self.subTest(mode=mode):
                 task=self.make_task();task.run();self.calls.clear()
                 if mode=='empty':self.boxes=[]
                 elif mode=='other_page':self.boxes[0].name='其他界面'
-                elif mode=='missing_value':self.boxes.pop(7)
                 else:
                     def fail(**kwargs):self.calls.append(kwargs);raise RuntimeError('OCR')
                     task.ocr=fail
@@ -136,3 +135,11 @@ class RealtimeTests(unittest.TestCase):
         self.assertNotIn('echo-score-status',self.drawn)
         self.assertIn('echo-score-status',self.cleared)
         self.assertFalse(hasattr(task,'diagnostics'))
+
+    def test_missing_value_replaces_previous_rows_with_current_paired_rows(self):
+        task=self.make_task();task.run();self.calls.clear()
+        self.boxes.pop(7);task.run()
+        self.assertEqual(self.calls,[{'frame':task.frame}])
+        self.assertEqual(len(task.painter.rectangles),6)
+        self.assertEqual(len(task.painter.row_scores),6)
+        self.assertEqual(len(task.painter.tier_labels),6)

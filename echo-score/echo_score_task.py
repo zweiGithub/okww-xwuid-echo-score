@@ -5,7 +5,7 @@ from ok import TriggerTask, og
 from echo_score import DEFAULT_TEMPLATE
 from echo_probability_service import TuningProbabilityService
 from echo_capture_recovery import CaptureRecoveryMonitor
-from echo_stat_overlay import ECHO_STAT_PAINTER_KEY, EchoStatBoxPainter, EchoStatAnalysis, analyze_echo_stats
+from echo_stat_overlay import ECHO_STAT_PAINTER_KEY, PROBABILITY_UNAVAILABLE, EchoStatBoxPainter, EchoStatAnalysis, analyze_echo_stats
 
 
 STATUS_PAINTER_KEY = "echo-score-status"
@@ -105,7 +105,8 @@ class EchoScoreOverlayTask(TriggerTask):
             boxes = self.ocr(frame=frame)
             analysis = analyze_echo_stats(boxes, width, height, template, **options)
         except Exception:
-            analysis = EchoStatAnalysis((), (), '识别暂不可用：当前画面读取失败')
+            analysis = EchoStatAnalysis((), (), PROBABILITY_UNAVAILABLE if options['show_probability']
+                                        else '识别暂不可用：当前画面读取失败')
         if getattr(analysis, "selected_template", None):
             self.auto_matched_template = analysis.selected_template
         self.painter.update(

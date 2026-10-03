@@ -88,33 +88,27 @@ class OverlayProbabilityTests(unittest.TestCase):
                     if service is not None:
                         service.close()
                 line = result.summary.splitlines()[-1]
-                self.assertIn('副词条类型无法识别', line)
+                self.assertEqual(line, '概率算不出来')
                 self.assertNotIn('误', line)
                 self.assertNotIn('\x00', result.summary)
                 self.assertNotIn('\u202e', result.summary)
-                self.assertEqual(len(result.summary.splitlines()), 5)
+                self.assertEqual(len(result.summary.splitlines()), 4)
                 self.assertLess(len(line), 65)
 
     def test_unknown_main_canonical_stat_remains_incompatible_with_cost(self):
         boxes = panel()
         boxes[2].name = '治疗效果错误'
-        self.assertIn('主词条与 COST 不匹配', self.analyze(boxes).summary)
+        self.assertEqual(self.analyze(boxes).summary.splitlines()[-1], '概率算不出来')
 
     def test_disabled_probability_preserves_original_three_line_summary(self):
         result = self.analyze(panel(), show_probability=False)
         self.assertEqual(len(result.summary.splitlines()), 3)
         self.assertNotIn('期望终分', result.summary)
 
-    def test_missing_or_unknown_ocr_rows_suppress_probability(self):
-        unknown = panel((('神秘属性', '6.3%'),))
-        missing = panel()
-        missing = [b for b in missing if not (b.name == '6.3%')]
-        unknown_similar = panel((('伤害加成错误', '6.3%'),))
-        for boxes in (unknown, missing, unknown_similar):
-            with self.subTest(boxes=boxes):
-                summary = self.analyze(boxes).summary
-                self.assertIn('概率暂不可用', summary)
-                self.assertNotIn('期望终分', summary)
+    def test_unknown_canonical_type_in_selected_rows_still_suppresses_probability(self):
+        summary=self.analyze(panel((('伤害加成错误','6.3%'),))).summary
+        self.assertIn('概率算不出来',summary)
+        self.assertNotIn('期望终分',summary)
 
     def test_invalid_tier_duplicate_and_extra_rows_suppress_probability(self):
         cases = [panel((('暴击', '6.4%'),)), panel((('暴击', '6.3%'), ('暴击', '6.9%'))),
@@ -122,12 +116,12 @@ class OverlayProbabilityTests(unittest.TestCase):
         for boxes in cases:
             with self.subTest(boxes=boxes):
                 summary = self.analyze(boxes).summary
-                self.assertIn('概率暂不可用', summary)
+                self.assertIn('概率算不出来', summary)
                 self.assertNotIn('期望终分', summary)
 
     def test_reconstruction_page_is_out_of_scope(self):
         result = self.analyze(panel(marker='声骸强化 声骸重构'))
-        self.assertIn('重构', result.summary)
+        self.assertEqual(result.summary.splitlines()[-1], '概率算不出来')
         self.assertNotIn('期望终分', result.summary)
 
     def test_background_pending_and_error_states_do_not_show_stale_numbers(self):
@@ -136,7 +130,7 @@ class OverlayProbabilityTests(unittest.TestCase):
                 self.status = status
             def request(self, *args):
                 return SimpleNamespace(status=self.status, result=None, reason='测试错误')
-        for status, text in [('pending', '概率计算中'), ('error', '概率暂不可用')]:
+        for status, text in [('pending', '概率计算中'), ('error', '概率算不出来')]:
             summary = self.analyze(panel(), probability_service=Service(status)).summary
             self.assertIn(text, summary)
             self.assertNotIn('期望终分', summary)
@@ -146,12 +140,12 @@ class OverlayProbabilityTests(unittest.TestCase):
             summary = analyze_echo_stats(panel(), 1000, 1000, name).summary
             self.assertIn('期望终分', summary)
         summary = analyze_echo_stats(panel(), 1000, 1000, '不存在的模板').summary
-        self.assertIn('评分模板无效', summary)
+        self.assertEqual(summary.splitlines()[-1], '概率算不出来')
         self.assertNotIn('期望终分', summary)
 
     def test_oversized_ocr_number_does_not_crash_or_show_probabilities(self):
         summary = self.analyze(panel((('暴击', '9'*400 + '%'),))).summary
-        self.assertIn('概率暂不可用', summary)
+        self.assertIn('概率算不出来', summary)
         self.assertNotIn('期望终分', summary)
 
     def test_precise_text_target_keeps_same_threshold_in_label_and_calculation(self):

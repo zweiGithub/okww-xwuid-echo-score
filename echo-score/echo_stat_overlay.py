@@ -21,6 +21,7 @@ from echo_probability import (
 
 
 ECHO_STAT_PAINTER_KEY = "echo-stat-boxes"
+PROBABILITY_UNAVAILABLE = "概率算不出来"
 TIER_TEXT_COLOR = (80, 185, 255)
 LOWEST_TIER_TEXT_COLOR = (80, 235, 130)
 HIGHEST_TIER_TEXT_COLOR = (255, 75, 75)
@@ -137,8 +138,12 @@ def analyze_echo_stats(ocr_boxes, screen_width, screen_height, template_name,
     else:
         return EchoStatAnalysis((), (), "", selected_template=matched_template or "")
     raw_rows = tuple(rows)
+    # Unused OCR fragments are not scoring inputs. Both calculations use the
+    # same paired rows; excessive paired slots and model errors still fail.
+    if recognition_problem == '存在未配对的名称或数值':
+        recognition_problem = ''
     if recognition_problem:
-        return EchoStatAnalysis((), (), f"{'概率' if show_probability else '识别'}暂不可用：{recognition_problem}",
+        return EchoStatAnalysis((), (), PROBABILITY_UNAVAILABLE if show_probability else f"识别暂不可用：{recognition_problem}",
                                 selected_template=matched_template or '', raw_rows=raw_rows)
 
     rows = rows[:7]
@@ -155,11 +160,11 @@ def analyze_echo_stats(ocr_boxes, screen_width, screen_height, template_name,
     try:
         score = calculate_echo_score(template_name, cost, cost_key, main_rows, sub_rows)
     except (OverflowError, ValueError, TypeError):
-        return EchoStatAnalysis(rectangles, (), '概率暂不可用：词条数值识别异常' if show_probability else '',
+        return EchoStatAnalysis(rectangles, (), PROBABILITY_UNAVAILABLE if show_probability else '',
                                 selected_template=matched_template or '',raw_rows=raw_rows,read_rows=tuple(rows),
                                 tier_labels=tier_labels,tier_colors=tier_colors)
     if score is None:
-        return EchoStatAnalysis(rectangles, (), "", selected_template=matched_template or "",raw_rows=raw_rows,read_rows=tuple(rows),
+        return EchoStatAnalysis(rectangles, (), PROBABILITY_UNAVAILABLE if show_probability else "", selected_template=matched_template or "",raw_rows=raw_rows,read_rows=tuple(rows),
                                 tier_labels=tier_labels,tier_colors=tier_colors)
     summary = (
         f"评分模板：{template_name}{' (自动匹配)' if automatic_template else ''}\n"
@@ -184,19 +189,19 @@ def _probability_summary(template_name, cost, main_rows, sub_rows, target_score,
     scope = f'五星普通估算 · 已识别{len(sub_rows)}/5'
     caveat = '核对完整词条；重构不适用'
     if recognition_problem:
-        return f'{scope}\n概率暂不可用：{recognition_problem}'
+        return PROBABILITY_UNAVAILABLE
     if service is not None:
         state = service.request(template_name, cost, main_rows, sub_rows, target_score)
         if state.status == 'pending':
             return f'{scope}\n概率计算中…\n{caveat}'
         if state.status != 'ready':
-            return f'{scope}\n概率暂不可用：{state.reason}'
+            return PROBABILITY_UNAVAILABLE
         projection = state.result
     else:
         try:
             projection = calculate_tuning_probability(template_name, cost, main_rows, sub_rows, target_score)
-        except TuningProbabilityError as error:
-            return f'{scope}\n概率暂不可用：{error}'
+        except TuningProbabilityError:
+            return PROBABILITY_UNAVAILABLE
     precise_target = Decimal(str(target_score))
     target_label = (f'{precise_target:.2f}'
                     if precise_target < 1e6 and precise_target == precise_target.quantize(Decimal('.01'))
