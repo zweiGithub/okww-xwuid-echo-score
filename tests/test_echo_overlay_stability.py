@@ -7,93 +7,23 @@ from unittest.mock import patch
 
 import test_echo_probability_host as host
 from test_echo_probability_overlay import box, panel, completed_panel
+from test_echo_columns import compact_panel
 from echo_stat_overlay import analyze_echo_stats, _paint_score_summary
 
 
 class LabelCropTests(unittest.TestCase):
-    def analyze(self, boxes, reader, width=2048, height=1152):
-        return analyze_echo_stats(boxes, width, height, '清宵-通用', label_ocr=reader)
+    def test_unknown_or_multiple_prefixes_are_never_guessed_without_anchors(self):
+        for name in ('茶茶暴击','1暴击','暴击错误','暴击伤'):
+            boxes=panel(((name,'6.3%'),))
+            result=analyze_echo_stats(boxes,1000,1000,'清宵-通用',label_ocr=lambda **kw:[])
+            self.assertNotIn('期望终分',result.summary)
 
-    def test_unknown_icon_requires_successful_current_crop_for_each_name(self):
-        for index, raw, name in ((2, '茶暴击伤害', '暴击伤害'), (4, '×攻击', '攻击')):
-            with self.subTest(raw=raw):
-                boxes = completed_panel(); boxes[index].name = raw
-                calls = []
-                def reader(**bounds):
-                    calls.append(bounds)
-                    return [box(name, bounds['x']*2048+1, bounds['y']*1152+2, 80, 20)]
-                result = self.analyze(boxes, reader)
-                self.assertIn('期望终分：28.42', result.summary)
-                self.assertEqual(len(calls), 1)
-                self.assertEqual(boxes[index].name, raw, 'Do not mutate full-frame OCR boxes')
-                bounds = calls[0]
-                self.assertGreater(bounds['x']*2048, boxes[index].x+24)
-                self.assertLess(bounds['x']*2048, boxes[index].x+38)
-                self.assertLessEqual(bounds['to_x']*2048, boxes[index].x+boxes[index].width)
-                self.assertLess(bounds['to_x']*2048, boxes[index+1].x)
-
-    def test_failed_ambiguous_or_different_crop_never_accepts_guess(self):
-        cases = ([], [box('茶暴击伤害',1645,252)], [box('暴击',1645,252)],
-                 [box('暴击伤害',1645,252),box('攻击',1800,252)],
-                 [box('+暴击伤害',1645,252)], [box('暴击伤害5档',1645,252)])
-        for results in cases:
-            with self.subTest(results=results):
-                boxes=completed_panel(); boxes[2].name='茶暴击伤害'
-                result=self.analyze(boxes,lambda **kw:results)
-                self.assertIn('概率暂不可用',result.summary)
-                self.assertNotIn('期望终分',result.summary)
-
-    def test_crop_is_bounded_in_both_panel_layouts_and_uses_relative_coordinates(self):
-        for boxes,w,h,index in ((completed_panel(),2048,1152,2),(panel(),1000,1000,2)):
-            boxes[index].name='茶'+boxes[index].name
-            candidate=boxes[index].name[1:]; calls=[]
-            def reader(**bounds):
-                calls.append(bounds)
-                return [box(candidate,bounds['x']*w,bounds['y']*h)]
-            result=self.analyze(boxes,reader,w,h)
-            self.assertIn('期望终分',result.summary)
-            self.assertEqual(len(calls),1)
-            b=calls[0]
-            self.assertEqual(set(b),{'x','y','to_x','to_y'})
-            self.assertTrue(0<=b['x']<b['to_x']<=1)
-            self.assertTrue(0<=b['y']<b['to_y']<=1)
-            self.assertLessEqual(b['to_x']*w,boxes[index].x+boxes[index].width)
-            self.assertLessEqual(b['to_x']*w,boxes[index+1].x)
-
-    def test_only_single_prefix_full_labels_are_retried_and_budget_is_two(self):
+    def test_non_echo_pages_never_call_cropped_ocr(self):
         calls=[]
-        def reader(**bounds): calls.append(bounds); return []
-        for raw in ('暴击伤害', '+暴击伤害','暴击伤','茶茶暴击伤害','暴击伤害茶','暴击伤害3档','1暴击伤害'):
-            boxes=completed_panel();boxes[2].name=raw
-            self.analyze(boxes,reader)
-        self.assertEqual(calls,[])
-        boxes=completed_panel()
-        for index in range(2,len(boxes),2): boxes[index].name='茶'+boxes[index].name
-        self.analyze(boxes,reader)
-        self.assertEqual(len(calls),2)
-
-    def test_previous_success_is_not_used_for_later_bad_frame_or_settings(self):
-        boxes=completed_panel();boxes[2].name='茶暴击伤害'
-        good=self.analyze(boxes,lambda **kw:[box('暴击伤害',1645,252)])
-        bad=self.analyze(boxes,lambda **kw:[])
-        self.assertIn('期望终分',good.summary)
-        self.assertNotIn('期望终分',bad.summary)
-        self.assertIn('茶暴击伤害',bad.summary)
-
-    def test_disabled_probability_and_non_echo_pages_do_not_retry(self):
-        boxes=completed_panel();boxes[2].name='茶暴击伤害';calls=[]
-        reader=lambda **kw:calls.append(kw) or []
-        result=analyze_echo_stats(boxes,2048,1152,'清宵-通用',show_probability=False,label_ocr=reader)
-        self.assertEqual(len(result.summary.splitlines()),3)
-        result=analyze_echo_stats(boxes[1:],2048,1152,'清宵-通用',label_ocr=reader)
+        result=analyze_echo_stats(completed_panel()[1:],2048,1152,'清宵-通用',
+                                  label_ocr=lambda **kw:calls.append(kw) or [])
         self.assertEqual(result.summary,'')
         self.assertEqual(calls,[])
-
-    def test_crop_exception_preserves_safe_diagnostic(self):
-        boxes=completed_panel();boxes[2].name='茶暴击伤害'
-        def failed(**kw): raise RuntimeError('OCR unavailable')
-        result=self.analyze(boxes,failed)
-        self.assertIn('概率暂不可用',result.summary)
 
 
 class CurrentFrameHostTests(unittest.TestCase):
@@ -114,9 +44,9 @@ class CurrentFrameHostTests(unittest.TestCase):
 
     def test_retry_uses_exact_same_frame_and_host_ocr_keyword_signature(self):
         task=host.load_module('echo_score_task').EchoScoreOverlayTask()
-        task.width=2048;task.height=1152;task.frame=SimpleNamespace(shape=(1152,2048,3))
+        task.width=2560;task.height=1440;task.frame=SimpleNamespace(shape=(1440,2560,3))
         frame=task.frame;calls=[]
-        boxes=completed_panel();boxes[2].name='茶暴击伤害'
+        boxes=compact_panel();boxes[4].name='茶攻击'
         def ocr(x=0,y=0,to_x=1,to_y=1,match=None,width=0,height=0,box=None,name=None,
                 threshold=0,frame=None,target_height=0,use_grayscale=False,log=False,
                 screenshot=False,frame_processor=None,lib='default'):
@@ -124,18 +54,18 @@ class CurrentFrameHostTests(unittest.TestCase):
             task.frame=SimpleNamespace(shape=(720,1280,3))  # A newer, resized frame arrives.
             task.width=1280;task.height=720
             if x==0:return boxes
-            return [SimpleNamespace(name=b.name.lstrip('茶'),x=b.x,y=b.y,width=b.width,height=b.height)
-                    for b in boxes[2:] if y*1152 <= b.y+b.height/2 <= to_y*1152]
+            p=next(p for p in boxes[2::2] if abs(p.y-y*1440)<.001)
+            return [SimpleNamespace(name=p.name.lstrip('+茶'),x=2050,y=p.y,width=min(p.x+p.width-2050,220),height=p.height)]
         task.ocr=ocr
         overlay=SimpleNamespace(draw=lambda *a:None,clear_draw=lambda *a:None)
         task._ensure_overlay=lambda:overlay;task.get_overlay_view=lambda:overlay
         task._settings=lambda:{'角色评分模板':'清宵-通用'}
         try:
             task.run()
-            self.assertEqual(len(calls),3)
+            self.assertEqual(len(calls),8)
             self.assertTrue(all(call[0] is frame for call in calls))
             self.assertNotIn('词条名称识别不完整',task.painter.summary)
-            self.assertTrue(.78 < calls[1][1] < .79, 'Consensus crop uses captured frame dimensions')
+            self.assertTrue(.79 < calls[1][1] < .81, 'Name crop uses captured frame dimensions')
             self.assertIn('当前评分',task.painter.summary)
         finally:task.on_destroy()
 

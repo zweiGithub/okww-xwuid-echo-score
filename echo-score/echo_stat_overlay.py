@@ -6,6 +6,7 @@ import ctypes
 from dataclasses import dataclass, replace
 from decimal import Decimal
 import os
+import math
 import re
 from types import SimpleNamespace
 
@@ -14,6 +15,7 @@ from echo_score import (
     substat_tier, substat_tier_label, template_names,
 )
 from echo_text import simplify_echo_text
+from echo_layout import EchoLayoutTracker
 from echo_probability import (
     TuningProbabilityError, calculate_tuning_probability, format_probability,
 )
@@ -30,7 +32,7 @@ SUMMARY_LEFT_RATIO = 0.43
 SUMMARY_TOP_RATIO = 0.24
 SUMMARY_RIGHT_RATIO = 0.75
 SUMMARY_MAX_LINES = 10
-MAX_LABEL_OCR_RETRIES = 2
+MAX_LABEL_OCR_RETRIES = 7
 _STAT_TEXT = re.compile(
     r"攻击|生命|防御|暴击|共鸣效率|伤害加成|治疗效果|ATK|HP|DEF|Crit|Energy|DMG|Heal",
     re.IGNORECASE,
@@ -85,6 +87,7 @@ class EchoStatAnalysis:
     tier_labels: tuple[str, ...] = ()
     tier_colors: tuple[tuple[int, int, int], ...] = ()
     selected_template: str = ""
+    raw_rows: tuple[RecognizedStatRow, ...] = ()
 
 
 def find_echo_stat_rectangles(ocr_boxes, screen_width, screen_height):
@@ -124,16 +127,13 @@ def analyze_echo_stats(ocr_boxes, screen_width, screen_height, template_name,
         "声骸技能", "合鸣效果", "Echo Skill", "Sonata Effect",
     ))
 
-    label_reader = _make_label_reader(label_ocr if show_probability else None, screen_width, screen_height)
     left_rows, left_problem = _find_ocr_rows(
         ocr_boxes, screen_width * 0.09, screen_width * 0.38,
         screen_height * 0.20, screen_height * 0.54, with_diagnostics=True,
-        label_reader=label_reader if is_tuning_page and layout_tracker is None else None,
     )
     right_rows, right_problem = _find_ocr_rows(
         ocr_boxes, screen_width * 0.76, screen_width * 0.99,
         screen_height * 0.18, screen_height * 0.47, with_diagnostics=True,
-        label_reader=label_reader if is_single_echo_page and not is_tuning_page and layout_tracker is None else None,
     )
 
     # Left-side stat rows are accepted only on the tuning page.  This excludes
@@ -148,28 +148,25 @@ def analyze_echo_stats(ocr_boxes, screen_width, screen_height, template_name,
             layout_tracker.reset()
         return EchoStatAnalysis((), (), "", selected_template=matched_template or "")
 
-    if layout_tracker is not None:
-        if recognition_problem:
-            return EchoStatAnalysis((), (), f'识别暂不可用：{recognition_problem}',
-                                    selected_template=matched_template or '')
-        layout, problem = layout_tracker.locate(rows, screen_width, screen_height,
-                                               'tuning' if is_tuning_page else 'detail')
-        if layout is not None and not recognition_problem:
-            rows, problem = _read_layout_rows(layout, rows, label_ocr, screen_width, screen_height)
-            if problem:
-                layout_tracker.reset()
-        else:
-            problem = problem or recognition_problem
-        if problem:
-            return EchoStatAnalysis((), (), f'识别暂不可用：{problem}',
-                                    selected_template=matched_template or '')
+    raw_rows = tuple(rows[:7])
+    if recognition_problem:
+        return EchoStatAnalysis((), (), f"{'概率' if show_probability else '识别'}暂不可用：{recognition_problem}",
+                                selected_template=matched_template or '', raw_rows=raw_rows)
+    tracker = layout_tracker or EchoLayoutTracker()
+    columns, _ = tracker.locate(raw_rows, screen_width, screen_height,
+                               'tuning' if is_tuning_page else 'detail')
+    rows, text_verified = _read_column_labels(columns, raw_rows, label_ocr,
+                                              screen_width, screen_height)
+    if text_verified:
+        columns = tracker.confirm_text()
+    display_rows = _display_column_rows(rows, columns, screen_width)
 
     rows = rows[:7]
     main_rows, sub_rows = rows[:2], rows[2:]
     cost = _find_cost(ocr_boxes, main_rows)
     cost_key = _cost_key(cost, main_rows)
-    rectangles = tuple(row.rectangle((255, 0, 0)) for row in main_rows)
-    rectangles += tuple(row.rectangle((255, 255, 255)) for row in sub_rows)
+    rectangles = tuple(row.rectangle((255, 0, 0) if i<2 else (255, 255, 255))
+                       for i,row in enumerate(display_rows))
     try:
         score = calculate_echo_score(template_name, cost, cost_key, main_rows, sub_rows)
     except (OverflowError, ValueError, TypeError):
@@ -189,13 +186,13 @@ def analyze_echo_stats(ocr_boxes, screen_width, screen_height, template_name,
             template_name, cost, main_rows, sub_rows, target_score,
             recognition_problem, probability_service,
         )
-    tier_labels = ("", "") + tuple(substat_tier_label(row.stat_name, row.value) if row.tier_visible else "" for row in sub_rows)
+    tier_labels = ("", "") + tuple(substat_tier_label(row.stat_name, row.value) if row.tier_visible else "" for row in display_rows[2:])
     tier_colors = ((255, 0, 0), (255, 0, 0)) + tuple(
         _tier_text_color(substat_tier(row.stat_name, row.value)) for row in sub_rows
     )
     return EchoStatAnalysis(
         rectangles, score.row_scores, summary, tier_labels, tier_colors,
-        matched_template or "",
+        matched_template or "", raw_rows,
     )
 
 
@@ -248,49 +245,6 @@ def _exact_stat_label(text):
     }
 
 
-def _make_label_reader(ocr, screen_width, screen_height):
-    """Retry at most two icon-contaminated labels, using only this frame's pixels.
-
-    The host callback accepts relative bounds and returns screen-space Boxes.
-    An unknown prefix is a reason to inspect the crop, never permission to
-    strip it. Both the full candidate and crop must name the same exact stat.
-    """
-    attempts = 0
-
-    def read_label(prop, value):
-        nonlocal attempts
-        compact = _clean_stat_label(prop.name)
-        candidate = compact[1:]
-        if (ocr is None or attempts >= MAX_LABEL_OCR_RETRIES or len(compact) < 2
-                or compact[0].isdigit() or not _exact_stat_label(candidate)
-                or _clean_stat_label(candidate) != candidate):
-            return str(prop.name)
-        # A stat icon occupies roughly one glyph-height at the row's left.
-        # Bound the crop by the original label box: it cannot include the
-        # value or our tier label, which is painted after that box.
-        left = max(0, round(prop.x + prop.height * 1.15))
-        right = min(screen_width, round(prop.x + prop.width), round(value.x - 2))
-        top = max(0, round(prop.y - 2))
-        bottom = min(screen_height, round(prop.y + prop.height + 2))
-        if right - left < prop.height or bottom <= top:
-            return str(prop.name)
-        attempts += 1
-        try:
-            boxes = ocr(x=left / screen_width, y=top / screen_height,
-                        to_x=right / screen_width, to_y=bottom / screen_height)
-            if len(boxes) == 1:
-                # Do not accept another icon or a partial/different label.
-                name = re.sub(r'\s+', '', simplify_echo_text(str(boxes[0].name)))
-                if name == candidate:
-                    return name
-        except Exception:
-            # A failed optional crop leaves the original safe diagnostic.
-            pass
-        return str(prop.name)
-
-    return read_label
-
-
 def _find_ocr_rows(ocr_boxes, min_x, max_x, min_y, max_y, with_diagnostics=False,
                    label_reader=None):
     candidates = [box for box in ocr_boxes if min_x <= box.x <= max_x and min_y <= box.y <= max_y]
@@ -341,63 +295,89 @@ def _find_ocr_rows(ocr_boxes, min_x, max_x, min_y, max_y, with_diagnostics=False
 
 
 def _label_geometry(prop):
-    """Clean labels already start at a glyph; prefixed boxes include an icon.
-
-    Prefix offsets are only candidate geometry for cross-row consensus, never
-    permission to accept the label itself. Unknown cropped labels stay invalid.
-    """
+    """Preserve raw bounds; a candidate name never implies an icon width."""
     raw = re.sub(r'\s+', '', str(prop.name))
     clean = _clean_stat_label(raw)
-    offset = 0
-    if clean != raw and _exact_stat_label(clean):
-        offset = prop.height*1.15
-    elif not _exact_stat_label(raw):
+    if not _exact_stat_label(clean):
         if len(clean)>1 and not clean[0].isdigit() and _exact_stat_label(clean[1:]):
             clean = clean[1:]
-            offset = prop.height*1.15
         else:
-            return None, 0, ''
-    return prop.x+offset, max(0,prop.width-offset), clean
+            clean = ''
+    return prop.x, prop.width, clean
 
 
-def _read_layout_rows(layout, full_rows, ocr, width, height):
-    """Two bounded same-frame group reads; no old values and no extra retries."""
-    if ocr is None:
-        return [], '词条裁剪识别不可用'
-    result = []
-    groups = (layout.main_centers, layout.sub_centers)
-    regions = layout.regions(width,height)
-    for centers, region in zip((g for g in groups if g), regions):
-        left,top,right,bottom = region
+def _read_column_labels(columns, raw_rows, ocr, width, height):
+    """Validate a shared text boundary, then trim names row by row on this frame.
+
+    Numeric values and every raw bound stay untouched. Failed optional reads
+    retain valid original labels; unknown names remain invalid, never cached.
+    """
+    if ocr is None or columns.text_left is None or len(columns.witnesses)<2:
+        return list(raw_rows), False
+    result = list(raw_rows)
+    pad = max(2, width*.0015)
+    attempts = 0
+    def read(index):
+        nonlocal attempts
+        row = raw_rows[index]
+        if not row.clean_label or attempts>=MAX_LABEL_OCR_RETRIES:
+            return False
+        x,y,w,h = row.label_bounds
+        left = max(0,x,columns.text_left-pad)
+        right = min(width,x+w,row.value_bounds[0]-2)
+        top,bottom = max(0,y),min(height,y+h)
+        if not all(math.isfinite(v) for v in (left,right,top,bottom)) or right<=left or bottom<=top:
+            return False
+        attempts += 1
         try:
             boxes = ocr(x=left/width,y=top/height,to_x=right/width,to_y=bottom/height)
+            if len(boxes)!=1:
+                return False
+            b = boxes[0]
+            name = re.sub(r'\s+', '', simplify_echo_text(str(b.name)))
+            # Exact identity plus crop containment prevents partial labels,
+            # unrelated OCR results and a different valid stat replacing this row.
+            if (name != row.clean_label or not _exact_stat_label(name)
+                    or not all(math.isfinite(v) for v in (b.x,b.y,b.width,b.height))
+                    or b.width<=0 or b.height<=0 or b.x<left-.01 or b.y<top-.01
+                    or b.x+b.width>right+.01 or b.y+b.height>bottom+.01):
+                return False
+            result[index] = replace(row,stat_name=_normalize_stat_name(name,row.value_text),
+                                    recognition_valid=True)
+            return True
         except Exception:
-            return [], '词条裁剪识别失败'
-        boxes = [SimpleNamespace(x=b.x,y=b.y,width=b.width,height=b.height,
-                                 name=simplify_echo_text(b.name),raw_stat_name=str(b.name)) for b in boxes]
-        rows, problem = _find_ocr_rows(boxes,left-3,right,top-3,bottom,with_diagnostics=True)
-        tolerance = max(3, (layout.main_height if not result else layout.sub_height)*.25)
-        if problem or len(rows)!=len(centers):
-            return [], '词条裁剪识别不完整'
-        for row,center in zip(rows,centers):
-            if abs(row.value_bounds[1]+row.value_bounds[3]/2-center)>tolerance:
-                return [], '词条布局正在重新定位'
-            # The crop must retain a complete exact label, even if the original
-            # full-frame OCR looked valid. Never replace it with cached text.
-            original = full_rows[len(result)]
-            if (not row.recognition_valid or not original.clean_label
-                    or row.clean_label != original.clean_label):
-                return [], '词条名称识别不完整'
-            row_height = layout.main_height if len(result)<2 else layout.sub_height
-            tier_x = round(layout.left+len(row.clean_label)*layout.glyph_width+8)
-            # A fixed tier anchor must not be clamped back over a long label.
-            # Hide it if this frame cannot prove a clear gap before the number.
-            tier_visible = (tier_x >= row.label_bounds[0]+row.label_bounds[2]+3
-                            and tier_x+max(36,row_height*1.5) <= row.value_bounds[0]-3)
-            result.append(replace(row,x=layout.left,y=round(center-row_height/2),
-                                  width=layout.right-layout.left,height=row_height,
-                                  tier_x=tier_x,tier_y=round(center-9),tier_visible=tier_visible))
-    return result, ''
+            return False
+    # No candidate becomes a text anchor solely because its OCR label is valid.
+    confirmed = set()
+    tried = set()
+    for i in columns.witnesses:
+        tried.add(i)
+        if read(i):
+            confirmed.add(raw_rows[i].clean_label)
+        if len(confirmed)>=2:
+            break
+    if len(confirmed)<2:
+        return list(raw_rows), False
+    for i in range(len(raw_rows)):
+        if i not in tried:
+            read(i)
+    return result, True
+
+
+def _display_column_rows(rows, columns, width):
+    """Display geometry is a copy; only X edges change, never raw row width/Y."""
+    left = (columns.text_left-max(2,width*.0015) if columns.text_validated else
+            columns.left-5 if columns.left is not None else None)
+    result = []
+    for i,row in enumerate(rows):
+        edge = columns.main_right if i<2 else columns.sub_right
+        x = max(0,round(left)) if left is not None else row.x
+        right = min(width,round(edge+5)) if edge is not None else row.x+row.width
+        if right<=x:
+            x,right = row.x,row.x+row.width
+        tier_visible = row.tier_x+max(36,row.label_bounds[3]*1.5)<=row.value_bounds[0]-3
+        result.append(replace(row,x=x,width=right-x,tier_visible=tier_visible))
+    return result
 
 
 def _numeric_value(text):

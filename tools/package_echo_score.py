@@ -7,7 +7,7 @@ import zipfile
 
 
 ROOT = Path(__file__).resolve().parents[1]
-CACHE_DIRECTORIES = {"__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache"}
+CACHE_DIRECTORIES = {"__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", "diagnostics"}
 ZIP_EPOCH = (1980, 1, 1, 0, 0, 0)
 
 
